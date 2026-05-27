@@ -238,39 +238,40 @@ class VaClient : public Component {
   // per WS frame), so contention is negligible.
   portMUX_TYPE ring_mux_ = portMUX_INITIALIZER_UNLOCKED;
 
-  // Per-turn latency anchors (millis()-relative). Captured at each state
-  // transition; flushed as one summary line when the deferred phase=idle
-  // emit fires (i.e. when the speaker has actually drained). Zero means
-  // "not yet hit this milestone this turn".
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
+  // Diagnostics are opt-in. Enable via `diagnostics: true` in the yaml
+  // schema. The original "speech drops into hiss" race (PSRAM cross-core
+  // sync, fixed in 5df34c2) made this code earn its keep, but in steady
+  // state production it just clutters the log and steals a few cycles per
+  // audio frame for counters nothing reads. Keeping it gated lets future
+  // bug hunters flip one yaml flag to re-enable the full per-turn audit.
+  //
+  // Three measurements per turn, logged together when the deferred
+  // phase=idle emit fires (i.e. when the speaker has actually drained):
+  //
+  //   1) WS frame inter-arrival time. If the bridge stalls and audio
+  //      arrives in bursts with > kWsGapWarnMs silence between, the
+  //      downstream chain may underrun and inject silence/noise.
+  //   2) TTS clipping. Volume scaling is unity by design (vol ≤ 1), so
+  //      this should never fire — it's a tripwire for anyone who
+  //      reintroduces a >1 gain factor.
+  //   3) Downstream underrun. speaker_->has_buffered_data() == false
+  //      while audio_fill_ > 0 means the resampler/mixer/i2s chain ran
+  //      dry while we still had PSRAM to feed it.
+  //
+  // Latency anchors, also per-turn:
   uint32_t turn_t_wake_{0};               // start_session() (wake-word handler)
   uint32_t turn_t_listening_{0};          // server's first phase=listening
   uint32_t turn_t_thinking_{0};           // server's phase=thinking (end-of-speech)
   uint32_t turn_t_first_audio_out_{0};    // first binary chunk arrived from server
 
-  // Diagnostics for the "speech sometimes drops into hiss / noise"
-  // symptom. We don't know the cause yet, so we measure three things
-  // simultaneously and let the logs tell us which one (if any) fires
-  // during a bad reply.
-  //
-  //  1) WS frame inter-arrival time. If the bridge stalls and audio
-  //     arrives in bursts with > kWsGapWarnMs silence between, the
-  //     downstream chain may underrun and inject silence/noise. We log
-  //     each large gap with the duration and how full the PSRAM ring
-  //     was at the time.
-  //  2) TTS clipping. Software gain is disabled, so clipping is
-  //     mathematically impossible while volume_ ≤ 1. Counter stays as
-  //     a tripwire — if anyone reintroduces a >1 scale factor, the
-  //     per-turn summary will surface it before users hear the rasp.
-  //  3) Downstream underrun. speaker_->has_buffered_data() = false
-  //     while audio_fill_ > 0 means the resampler/mixer/i2s chain ran
-  //     dry while we still had PSRAM to feed it — bug or stall in the
-  //     downstream side. We log the first underrun per reply.
   uint32_t last_binary_ms_{0};
-  uint32_t ws_gap_count_{0};       // # gaps > kWsGapWarnMs in this turn
-  uint32_t ws_gap_max_ms_{0};      // largest gap observed this turn
-  uint32_t clipped_samples_{0};    // clipped samples in this turn
+  uint32_t ws_gap_count_{0};
+  uint32_t ws_gap_max_ms_{0};
+  uint32_t clipped_samples_{0};
   bool underrun_logged_this_turn_{false};
   static constexpr uint32_t kWsGapWarnMs = 80;  // > ~3× normal 20 ms frame
+#endif
 };
 
 }  // namespace va_client

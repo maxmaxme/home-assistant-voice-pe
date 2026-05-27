@@ -84,6 +84,7 @@ void VaClient::loop() {
     size_t fill = this->audio_fill_;
     portEXIT_CRITICAL(&this->ring_mux_);
     if (fill > 0) {
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
       // Detector 3: downstream underrun. If the resampler/mixer/i2s chain
       // ran out of bytes to play while we *still* have PSRAM queued,
       // something hiccupped downstream — the user hears silence or a
@@ -94,6 +95,7 @@ void VaClient::loop() {
                  (unsigned) fill);
         this->underrun_logged_this_turn_ = true;
       }
+#endif
       // Contiguous slice we can hand to play() without copying: from head
       // to either the end of the buffer or the tail.
       size_t contiguous = (head < tail) ? (tail - head) : (kAudioBufBytes - head);
@@ -412,6 +414,7 @@ void VaClient::handle_text_(const char *data, size_t len) {
 void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   if (this->speaker_ == nullptr || len < 2 || this->audio_buf_ == nullptr)
     return;
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
   const uint32_t now_ms = millis();
   if (this->turn_t_first_audio_out_ == 0 && this->turn_t_wake_ != 0) {
     this->turn_t_first_audio_out_ = now_ms;
@@ -431,6 +434,7 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
     }
   }
   this->last_binary_ms_ = now_ms;
+#endif
   // PCM16 mono @ 24 kHz, append to ring buffer. loop() drains.
   // Snapshot audio_fill_ under the lock — it's modified by loop() on the
   // other core and we can't trust a torn read.
@@ -461,14 +465,27 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
     else if (vol > 1.0f) vol = 1.0f;
     // Q15 fixed point so the inner loop stays integer-only.
     int32_t scale = static_cast<int32_t>(vol * 32768.0f);
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
     uint32_t clipped = 0;
+#endif
     for (size_t i = 0; i < pairs; i++) {
       int32_t v = (static_cast<int32_t>(in[i]) * scale) >> 15;
-      if (v > 32767) { v = 32767; clipped++; }
-      else if (v < -32768) { v = -32768; clipped++; }
+      if (v > 32767) {
+        v = 32767;
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
+        clipped++;
+#endif
+      } else if (v < -32768) {
+        v = -32768;
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
+        clipped++;
+#endif
+      }
       this->mono_buf_[i] = static_cast<int16_t>(v);
     }
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
     this->clipped_samples_ += clipped;
+#endif
     data = reinterpret_cast<const uint8_t *>(this->mono_buf_.data());
     // len is unchanged (pairs * 2 == len rounded down; trailing odd byte ignored).
     len = pairs * 2;
@@ -554,9 +571,11 @@ void VaClient::set_phase_(const std::string &phase) {
       ESP_LOGI(TAG, "phase=listening — mic streaming on");
       this->streaming_ = true;
     }
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
     if (this->turn_t_listening_ == 0 && this->turn_t_wake_ != 0) {
       this->turn_t_listening_ = millis();
     }
+#endif
     // Server heard us — watchdog no longer needed.
     this->cancel_timeout("va_no_speech");
     this->cancel_timeout("va_followup");
@@ -565,9 +584,11 @@ void VaClient::set_phase_(const std::string &phase) {
       ESP_LOGI(TAG, "phase=%s — mic streaming off", phase.c_str());
       this->streaming_ = false;
     }
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
     if (phase == "thinking" && this->turn_t_thinking_ == 0 && this->turn_t_wake_ != 0) {
       this->turn_t_thinking_ = millis();
     }
+#endif
     this->cancel_timeout("va_followup");
     this->cancel_timeout("va_followup_open");
     this->cancel_timeout("va_tts_tail");
@@ -680,6 +701,7 @@ void VaClient::start_session() {
   this->cancel_timeout("va_followup");
   this->cancel_timeout("va_followup_open");
   this->cancel_timeout("va_tts_tail");
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
   // Anchor turn-latency timestamps for the new turn.
   this->turn_t_wake_ = millis();
   this->turn_t_listening_ = 0;
@@ -691,6 +713,7 @@ void VaClient::start_session() {
   this->ws_gap_max_ms_ = 0;
   this->clipped_samples_ = 0;
   this->underrun_logged_this_turn_ = false;
+#endif
   // Watchdog: if server doesn't hear us within kNoSpeechTimeoutMs, abort the
   // session so we're not stuck with the mic open after a misfire.
   this->set_timeout("va_no_speech", kNoSpeechTimeoutMs, [this]() {
@@ -702,7 +725,9 @@ void VaClient::start_session() {
       esp_websocket_client_send_text(handle, m, sizeof(m) - 1, portMAX_DELAY);
     }
     this->streaming_ = false;
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
     this->turn_t_wake_ = 0;
+#endif
     // Force LED back to idle from yaml side.
     this->defer([this]() {
       for (auto *t : this->phase_triggers_) {
@@ -723,6 +748,7 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
         t->trigger("idle");
       }
     });
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
     // Per-turn latency summary. Anchors are zero if we skipped a milestone
     // (e.g. interrupt mid-reply); show "?" so the line stays readable.
     if (this->turn_t_wake_ != 0) {
@@ -754,6 +780,7 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
       }
       this->turn_t_wake_ = 0;  // mark turn as logged
     }
+#endif
   }
   if (duration_ms == 0) {
     // Follow-up disabled for this call: turn-based behaviour like the

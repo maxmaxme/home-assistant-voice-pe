@@ -12,6 +12,7 @@ CONF_TOKEN = "token"
 CONF_MICROPHONE = "microphone"
 CONF_MIC_CHANNEL = "mic_channel"
 CONF_SPEAKER = "speaker"
+CONF_DIAGNOSTICS = "diagnostics"
 CONF_ON_PHASE = "on_phase"
 CONF_ON_REPEATED_FAILURE = "on_repeated_failure"
 CONF_ON_FOLLOWUP_OPENED = "on_followup_opened"
@@ -36,6 +37,12 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_MICROPHONE): cv.use_id(microphone.Microphone),
         cv.Optional(CONF_MIC_CHANNEL, default=0): cv.int_range(min=0, max=1),
         cv.Required(CONF_SPEAKER): cv.use_id(speaker.Speaker),
+        # Per-turn latency anchors + WS gap / clipping / underrun detectors.
+        # Opt-in because in steady-state production they just clutter the log
+        # and burn a handful of cycles per audio frame on counters nothing
+        # reads. Flip to true when chasing audio-quality bugs, then turn back
+        # off after the fix lands.
+        cv.Optional(CONF_DIAGNOSTICS, default=False): cv.boolean,
         cv.Optional(CONF_ON_PHASE): automation.validate_automation(
             {
                 cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(OnPhaseTrigger),
@@ -65,6 +72,9 @@ async def to_code(config):
     # ArduinoJson is header-only and ESPHome already uses it in several core
     # components, so the build infra is well-trodden.
     cg.add_library("ArduinoJson", "7.4.2")
+
+    if config[CONF_DIAGNOSTICS]:
+        cg.add_define("USE_VA_CLIENT_DIAGNOSTICS")
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
