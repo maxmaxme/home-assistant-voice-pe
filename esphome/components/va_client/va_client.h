@@ -83,6 +83,25 @@ class VaClient : public Component {
   void on_ws_event(int32_t event_id, void *event_data);
 
  protected:
+  // Internal state machine. One canonical source of truth for the
+  // bridge's lifecycle; everything else (mic gating, LED emission, drain
+  // logic, timer ownership) derives from it. Declared up here because
+  // method declarations below take State as a parameter — C++ resolves
+  // class-scoped types in declaration order, so the enum must come
+  // first.
+  enum class State : uint8_t {
+    Idle,           // bridge idle, mic off, no audio queued
+    Listening,      // mic streaming up; pre- and post-server-VAD confirm
+    Thinking,       // server processing (incl. tool calls); mic off
+    Replying,       // TTS audio coming down; mic off
+    WaitingDrain,   // server said idle; we're waiting for the ring +
+                    //   speaker chain to actually play out before
+                    //   emitting LED-idle and (maybe) opening followup
+    FollowupArmed,  // request_follow_up handoff: yaml is playing the
+                    //   chime; commit_followup_mic() will transition
+                    //   us back to Listening when the chime ends
+  };
+
   void connect_();
   void schedule_reconnect_();
   void on_mic_data_(const std::vector<uint8_t> &samples);
@@ -127,22 +146,6 @@ class VaClient : public Component {
   // guard we'd double-bump the backoff delay and double-log.
   bool reconnect_pending_{false};
 
-  // Internal state machine. One canonical source of truth for the
-  // bridge's lifecycle; everything else (mic gating, LED emission, drain
-  // logic, timer ownership) derives from it. See transition() in the
-  // .cpp for the allowed edges and what each state means.
-  enum class State : uint8_t {
-    Idle,           // bridge idle, mic off, no audio queued
-    Listening,      // mic streaming up; pre- and post-server-VAD confirm
-    Thinking,       // server processing (incl. tool calls); mic off
-    Replying,       // TTS audio coming down; mic off
-    WaitingDrain,   // server said idle; we're waiting for the ring +
-                    //   speaker chain to actually play out before
-                    //   emitting LED-idle and (maybe) opening followup
-    FollowupArmed,  // request_follow_up handoff: yaml is playing the
-                    //   chime; commit_followup_mic() will transition
-                    //   us back to Listening when the chime ends
-  };
   State current_state_{State::Idle};
   uint32_t state_entered_ms_{0};
 
