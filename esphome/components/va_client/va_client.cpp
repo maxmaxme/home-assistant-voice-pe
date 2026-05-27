@@ -3,6 +3,8 @@
 #include "esphome/core/log.h"
 #include "esphome/components/audio/audio.h"
 
+#include <ArduinoJson.h>
+
 #include <cstring>
 
 #include <esp_websocket_client.h>
@@ -333,11 +335,31 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
 }
 
 void VaClient::handle_text_(const char *data, size_t len) {
-  std::string msg(data, len);
-  ESP_LOGD(TAG, "WS text: %s", msg.c_str());
+  ESP_LOGD(TAG, "WS text: %.*s", (int) len, data);
 
-  if (msg.find("\"type\":\"error\"") != std::string::npos) {
-    ESP_LOGW(TAG, "Server reported error: %s", msg.c_str());
+  // ArduinoJson 7. The control channel sends tiny JSON objects — 128 bytes
+  // of stack-backed JsonDocument is plenty for the largest message we send
+  // today ({"type":"phase","value":"listening"} ≈ 38 bytes) with headroom
+  // for future fields. If a message ever overflows, deserializeJson() returns
+  // NoMemory and we fall through to the "unknown" branch below, which logs
+  // and ignores — strictly safer than the previous substring scan which
+  // could match across keys.
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, data, len);
+  if (err) {
+    ESP_LOGW(TAG, "bad WS text frame: %s (%.*s)", err.c_str(), (int) len, data);
+    return;
+  }
+
+  const char *type = doc["type"].as<const char *>();
+  if (type == nullptr) {
+    ESP_LOGW(TAG, "WS text frame missing 'type': %.*s", (int) len, data);
+    return;
+  }
+
+  if (std::strcmp(type, "error") == 0) {
+    const char *server_msg = doc["message"].as<const char *>();
+    ESP_LOGW(TAG, "server error: %s", server_msg ? server_msg : "<no message>");
     // Without an audible cue the user just sees the LED go idle and
     // assumes the assistant ignored them. Reuse the on_repeated_failure
     // trigger — it already plays error_cloud_expired and the failure
@@ -351,7 +373,7 @@ void VaClient::handle_text_(const char *data, size_t len) {
     return;
   }
 
-  if (msg.find("\"type\":\"request_follow_up\"") != std::string::npos) {
+  if (std::strcmp(type, "request_follow_up") == 0) {
     // Server's model called the request_follow_up tool — it asked a
     // question and wants the user to answer without saying a wake word.
     // Defer to loop()'s waiting_for_speaker_stop_ logic so we only fire
@@ -367,16 +389,24 @@ void VaClient::handle_text_(const char *data, size_t len) {
     return;
   }
 
-  // Substring match on `"value":"<phase>"` — keeps us out of a JSON parser
-  // until M3 needs richer payloads.
-  static const char *const kPhases[] = {"listening", "thinking", "replying", "idle"};
-  for (const char *p : kPhases) {
-    std::string needle = std::string("\"value\":\"") + p + "\"";
-    if (msg.find(needle) != std::string::npos) {
-      this->set_phase_(p);
+  if (std::strcmp(type, "phase") == 0) {
+    const char *value = doc["value"].as<const char *>();
+    if (value == nullptr) {
+      ESP_LOGW(TAG, "phase frame missing 'value': %.*s", (int) len, data);
       return;
     }
+    // Whitelist the known phases — anything else is forward-compat noise.
+    if (std::strcmp(value, "idle") == 0 || std::strcmp(value, "listening") == 0 ||
+        std::strcmp(value, "thinking") == 0 || std::strcmp(value, "replying") == 0) {
+      this->set_phase_(value);
+    } else {
+      ESP_LOGD(TAG, "ignoring unknown phase '%s'", value);
+    }
+    return;
   }
+
+  // hello / pong / anything we don't model yet — silently ignore.
+  ESP_LOGD(TAG, "WS text ignored: type=%s", type);
 }
 
 void VaClient::handle_binary_(const uint8_t *data, size_t len) {

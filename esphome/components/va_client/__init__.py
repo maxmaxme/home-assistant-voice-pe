@@ -61,6 +61,10 @@ async def to_code(config):
         name="espressif/esp_websocket_client",
         ref="1.7.0",
     )
+    # JSON parser for the control channel ({"type":"phase","value":"..."} etc.).
+    # ArduinoJson is header-only and ESPHome already uses it in several core
+    # components, so the build infra is well-trodden.
+    cg.add_library("ArduinoJson", "7.4.2")
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
