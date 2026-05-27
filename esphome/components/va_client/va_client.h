@@ -88,8 +88,25 @@ class VaClient : public Component {
   void on_mic_data_(const std::vector<uint8_t> &samples);
   void handle_text_(const char *data, size_t len);
   void handle_binary_(const uint8_t *data, size_t len);
-  void set_phase_(const std::string &phase);
-  void open_followup_window_(uint32_t duration_ms = kFollowupMs);
+  // Move the state machine to `next` and emit a phase LED transition to
+  // `phase_label` (the user-visible name passed to yaml triggers). Stamps
+  // state_entered_ms_ so state-bound timers can reference it.
+  void transition_(State next, const std::string &phase_label);
+  // Apply the server's reported phase ("listening" | "thinking" | "replying"
+  // | "idle") to the state machine. Mostly a wrapper around transition_
+  // with the policy choices (when to defer LED-idle, when to open follow-
+  // up, etc.) collected in one place.
+  void apply_server_phase_(const std::string &phase);
+  // Returns true if the mic should be forwarding frames to the server.
+  // Single derivation from current_state_ — no separate streaming flag.
+  bool is_mic_streaming_() const;
+  // Fire the on_phase trigger from the main loop. transition_ may be
+  // called from the WS task; ESPHome triggers aren't thread-safe so we
+  // marshal the actual trigger fire onto the main loop via defer().
+  void emit_phase_(const std::string &phase);
+  // Called once the speaker chain has actually drained (or kSpeakerStopTimeoutMs
+  // elapsed). Decides whether to open a follow-up window or go straight to Idle.
+  void finish_drain_();
 
   std::string url_;
   std::string token_;
@@ -109,6 +126,35 @@ class VaClient : public Component {
   // DISCONNECTED and CLOSED (and sometimes ERROR) per failure; without this
   // guard we'd double-bump the backoff delay and double-log.
   bool reconnect_pending_{false};
+
+  // Internal state machine. One canonical source of truth for the
+  // bridge's lifecycle; everything else (mic gating, LED emission, drain
+  // logic, timer ownership) derives from it. See transition() in the
+  // .cpp for the allowed edges and what each state means.
+  enum class State : uint8_t {
+    Idle,           // bridge idle, mic off, no audio queued
+    Listening,      // mic streaming up; pre- and post-server-VAD confirm
+    Thinking,       // server processing (incl. tool calls); mic off
+    Replying,       // TTS audio coming down; mic off
+    WaitingDrain,   // server said idle; we're waiting for the ring +
+                    //   speaker chain to actually play out before
+                    //   emitting LED-idle and (maybe) opening followup
+    FollowupArmed,  // request_follow_up handoff: yaml is playing the
+                    //   chime; commit_followup_mic() will transition
+                    //   us back to Listening when the chime ends
+  };
+  State current_state_{State::Idle};
+  uint32_t state_entered_ms_{0};
+
+  // Set during Replying when the server sends {"type":"request_follow_up"}.
+  // Consumed on Replying → WaitingDrain → FollowupArmed to use the longer
+  // mic window (kRequestFollowUpMs) and fire on_followup_opened so yaml
+  // plays the question chime.
+  bool request_follow_up_for_next_turn_{false};
+  // Set by send_interrupt(). Consumed on the next server phase=idle so
+  // it routes WaitingDrain → Idle (no chime, no mic) instead of opening
+  // a follow-up window the user explicitly cancelled.
+  bool interrupt_pending_{false};
 
   std::string current_phase_{"idle"};
   std::vector<OnPhaseTrigger *> phase_triggers_;
@@ -131,35 +177,6 @@ class VaClient : public Component {
   // Scratch buffers reused on the hot path to avoid per-callback heap allocation.
   std::vector<int16_t> mono_buf_;
 
-  // Streaming gate. True while the mic should be forwarded to the server:
-  //   - between wake-word start_session() and "listening"/"thinking"
-  //   - and again after "idle" for kFollowupMs (in case AI asked a question)
-  bool streaming_{false};
-  // Set on phase=idle when there's still TTS audio queued — we can't open
-  // the mic until the speaker drains, otherwise it picks up its own output.
-  // loop() flips this to a live followup window once audio_fill_ hits 0.
-  bool followup_pending_{false};
-  // Tracks whether the pending follow-up was requested by the server's
-  // request_follow_up tool (model asked a question) vs the natural
-  // post-reply path. The former wants a longer mic window
-  // (kRequestFollowUpMs); the latter uses kFollowupMs (which is 0 by
-  // default — no auto-follow-up).
-  bool request_follow_up_pending_{false};
-  // Set when on_followup_opened has fired and we're waiting on yaml to
-  // play the chime + call commit_followup_mic(). Cleared on commit or
-  // when a new session preempts. Without this flag a stale
-  // commit_followup_mic() call (e.g. delayed lambda after a `Stop` wake
-  // word already reset state) would re-open the mic out of nowhere.
-  bool followup_armed_{false};
-  // Server sends phase=idle when OpenAI is done generating, but we still
-  // have audio queued in PSRAM + downstream rings. If we fire the LED
-  // trigger immediately the device looks idle while still speaking. Hold
-  // the "idle" emission until the queue drains + kFollowupOpenDelayMs.
-  bool idle_emit_pending_{false};
-  // Set by send_interrupt() so the phase=idle that follows from the server
-  // doesn't trigger a follow-up mic window. The user explicitly asked us to
-  // stop — they don't want the device sitting there listening.
-  bool suppress_followup_{false};
   // Follow-up dialog window after a real turn ends. 0 disables — mic
   // closes immediately after each reply, like the original turn-based
   // pipeline. Currently 0 because XMOS AEC is too leaky and the mic
@@ -176,15 +193,6 @@ class VaClient : public Component {
   // user pressed wake/button and stayed silent — close the session so we
   // don't sit there with the mic open eating OpenAI minutes.
   static constexpr uint32_t kNoSpeechTimeoutMs = 7000;
-  // After our PSRAM queue drains there's still audio in flight:
-  //   resampler ring 4800 B (≈ 50 ms)
-  //   mixer source buffer 100 ms
-  //   i2s_audio_speaker buffer_duration 500 ms
-  //   XMOS DSP pipeline / DAC analog tail ≈ 100 ms
-  // Sum ≈ 750 ms. We add headroom so a slow drain doesn't leak TTS into
-  // the mic — every leak triggers the server VAD because the XMOS AEC
-  // doesn't fully cancel our own speaker output (M3.2 measured ~10× leak).
-  static constexpr uint32_t kFollowupOpenDelayMs = 1500;
   // Hard ceiling on how long we'll wait for the speaker chain to drain
   // (resampler ring + mixer source ring, via has_buffered_data()) after
   // PSRAM hits 0 before giving up and proceeding anyway. Should be >
@@ -193,15 +201,6 @@ class VaClient : public Component {
   // margin, but short enough that a wedged speaker doesn't lock the
   // LED in `replying` forever.
   static constexpr uint32_t kSpeakerStopTimeoutMs = 3000;
-
-  // True while we're waiting for the downstream speaker chain to actually
-  // finish playing the TTS we wrote into it. Entered when audio_fill_
-  // hits 0 with followup_pending_ set; exited when
-  // !speaker_->has_buffered_data() OR kSpeakerStopTimeoutMs elapses.
-  bool waiting_for_speaker_stop_{false};
-  // millis() snapshot from when waiting_for_speaker_stop_ went true.
-  // Used to fire the fallback timeout if the chain never drains.
-  uint32_t speaker_stop_wait_started_ms_{0};
 
   // Tracks the opcode of the in-flight WS message so we can route
   // continuation frames (op_code = 0) to the same handler.

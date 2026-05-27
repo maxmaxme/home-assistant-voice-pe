@@ -120,44 +120,34 @@ void VaClient::loop() {
       }
     }
   }
-  // If a follow-up window was deferred while audio was draining, wait for
-  // the downstream chain (resampler + mixer + i2s + DAC tail) to actually
-  // finish playing before firing the deferred LED-idle / chime trigger.
-  // Just because our PSRAM queue is empty doesn't mean the user has heard
-  // the audio yet — and an "сейчас посмотрю" preamble before a tool call
-  // would drain the ring mid-turn, so we can't act on audio_fill_==0
-  // alone.
+  // While in WaitingDrain, monitor the downstream speaker chain
+  // (resampler + mixer + i2s + DAC tail). Just because our PSRAM queue
+  // is empty doesn't mean the user has heard the audio yet — and an
+  // "сейчас посмотрю" preamble before a tool call would drain the ring
+  // mid-turn, so we can't act on audio_fill_==0 alone.
   //
-  // Primary signal: speaker_->is_stopped(). The resampling speaker
-  // transitions to STOPPED only after every byte we wrote has actually
-  // gone out through the i2s pipeline.
+  // Primary signal: speaker_->has_buffered_data() — walks the chain
+  // (resampler ring + mixer source ring) and returns false as soon as
+  // both have drained. We use this instead of is_stopped() because the
+  // resampler only transitions to STATE_STOPPED once its downstream
+  // (mixer source) reports stopped, but our mixer sources are configured
+  // `timeout: never` and stay RUNNING forever, so is_stopped() would
+  // never fire.
+  //
+  // Note: this does *not* cover the i2s 500ms ring + ~100ms DAC tail
+  // downstream of the mixer. We fire ~500ms before true silence. For
+  // the LED that's imperceptible; for the request_follow_up chime,
+  // yaml's wait_until !is_announcing + i2s tail delay already absorbs
+  // any small overlap with the fading TTS tail.
   //
   // Fallback: kSpeakerStopTimeoutMs (3 s). If something wedges and the
-  // speaker never reports STOPPED, we still progress so the LED doesn't
-  // lock in `replying`.
-  if (this->followup_pending_ && this->audio_fill_ == 0 &&
-      !this->waiting_for_speaker_stop_) {
-    this->waiting_for_speaker_stop_ = true;
-    this->speaker_stop_wait_started_ms_ = millis();
-  }
-  if (this->waiting_for_speaker_stop_) {
-    // Use has_buffered_data() instead of is_stopped(): the resampler only
-    // transitions to STATE_STOPPED once its downstream (mixer source)
-    // reports stopped, but our mixer sources are configured `timeout:
-    // never` and stay RUNNING forever, so is_stopped() would never fire
-    // and we'd always hit the fallback. has_buffered_data() walks the
-    // chain (resampler ring + mixer source ring) and returns false as
-    // soon as both have drained — exactly what we want.
-    //
-    // Note: this does *not* cover the i2s 500ms ring + ~100ms DAC tail
-    // downstream of the mixer. We fire ~500ms before true silence. For
-    // the LED that's imperceptible; for the request_follow_up chime,
-    // yaml's wait_until !is_announcing + i2s tail delay already absorbs
-    // any small overlap with the fading TTS tail.
+  // speaker never drains, we still progress so the LED doesn't lock in
+  // `replying` forever.
+  if (this->current_state_ == State::WaitingDrain && this->audio_fill_ == 0) {
     const bool speaker_drained =
         (this->speaker_ != nullptr) && !this->speaker_->has_buffered_data();
     const bool timed_out =
-        (millis() - this->speaker_stop_wait_started_ms_) >= kSpeakerStopTimeoutMs;
+        (millis() - this->state_entered_ms_) >= kSpeakerStopTimeoutMs;
     if (speaker_drained || timed_out) {
       if (timed_out && !speaker_drained) {
         ESP_LOGW(TAG,
@@ -165,25 +155,7 @@ void VaClient::loop() {
                  "proceeding anyway (fallback)",
                  (unsigned) kSpeakerStopTimeoutMs);
       }
-      this->waiting_for_speaker_stop_ = false;
-      const bool was_request = this->request_follow_up_pending_;
-      this->followup_pending_ = false;
-      this->request_follow_up_pending_ = false;
-      if (was_request) {
-        // Request-driven path: speaker has drained, now hand off to yaml
-        // for the chime → wait_until !is_announcing → commit_followup_mic
-        // sequence (announcement lane is separate from the TTS lane we
-        // just waited on, so the chime won't collide with our tail).
-        this->open_followup_window_(0);  // emit deferred LED idle + latency log; no mic
-        this->followup_armed_ = true;
-        for (auto *t : this->followup_opened_triggers_) {
-          t->trigger();
-        }
-      } else {
-        // Natural-idle path (kFollowupMs = 0): just emit the deferred
-        // LED idle. No chime, no mic.
-        this->open_followup_window_(kFollowupMs);
-      }
+      this->finish_drain_();
     }
   }
 }
@@ -288,7 +260,7 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
       const char start_msg[] = "{\"type\":\"start\"}";
       auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
       esp_websocket_client_send_text(handle, start_msg, sizeof(start_msg) - 1, portMAX_DELAY);
-      this->set_phase_("idle");
+      this->apply_server_phase_("idle");
       break;
     }
     case WEBSOCKET_EVENT_DATA: {
@@ -327,7 +299,7 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
       // failure counter and the fired flag. A flapping link won't earn
       // a fresh chime.
       this->cancel_timeout("va_stable_connection");
-      this->set_phase_("idle");
+      this->apply_server_phase_("idle");
       this->schedule_reconnect_();
       break;
     }
@@ -371,23 +343,21 @@ void VaClient::handle_text_(const char *data, size_t len) {
     for (auto *t : this->repeated_failure_triggers_) {
       t->trigger();
     }
-    this->set_phase_("idle");
+    this->apply_server_phase_("idle");
     return;
   }
 
   if (std::strcmp(type, "request_follow_up") == 0) {
     // Server's model called the request_follow_up tool — it asked a
     // question and wants the user to answer without saying a wake word.
-    // Defer to loop()'s waiting_for_speaker_stop_ logic so we only fire
-    // the chime + arm the mic after speaker_->is_stopped() returns true
-    // (i.e. the i2s pipeline has finished playing the question's audio).
-    // Setting both pending flags is idempotent — loop() handles both the
-    // "already drained" and "still queued" cases uniformly via the
-    // speaker-state poll.
-    ESP_LOGI(TAG, "request_follow_up — waiting for speaker drain (%u bytes queued)",
-             (unsigned) this->audio_fill_);
-    this->followup_pending_ = true;
-    this->request_follow_up_pending_ = true;
+    // Latch the modifier; the upcoming phase=idle will route us through
+    // WaitingDrain → finish_drain_() which fires on_followup_opened
+    // after the speaker chain empties. Only meaningful while a turn is
+    // actually in flight; outside of that the next idle isn't a turn-
+    // end signal anyway and the flag is harmless.
+    ESP_LOGI(TAG, "request_follow_up received (state=%d, fill=%u bytes)",
+             (int) this->current_state_, (unsigned) this->audio_fill_);
+    this->request_follow_up_for_next_turn_ = true;
     return;
   }
 
@@ -400,7 +370,7 @@ void VaClient::handle_text_(const char *data, size_t len) {
     // Whitelist the known phases — anything else is forward-compat noise.
     if (std::strcmp(value, "idle") == 0 || std::strcmp(value, "listening") == 0 ||
         std::strcmp(value, "thinking") == 0 || std::strcmp(value, "replying") == 0) {
-      this->set_phase_(value);
+      this->apply_server_phase_(value);
     } else {
       ESP_LOGD(TAG, "ignoring unknown phase '%s'", value);
     }
@@ -520,7 +490,7 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
   // random speech in the room — wake word would become decoration. The
   // session opens via start_session() (wake-word handler) and closes on
   // "phase":"idle" coming back from the server (response.done).
-  if (!this->streaming_)
+  if (!this->is_mic_streaming_())
     return;
   // i2s_mics yields interleaved stereo int32 frames: [L0_low,L0_high, R0_low,R0_high, L1..].
   // Each frame = 8 bytes (2ch × 4 bytes). We want one channel converted to
@@ -548,29 +518,56 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
                                 10 / portTICK_PERIOD_MS);
 }
 
-void VaClient::set_phase_(const std::string &phase) {
-  // Don't dedupe — we want yaml-side control_leds to re-render even on
-  // identical phase if other inputs (e.g. va WS connection state) have
-  // changed since the last emission.
-  const std::string prev_phase = this->current_phase_;
-  this->current_phase_ = phase;
-  ESP_LOGD(TAG, "Phase -> %s", phase.c_str());
+// ---- State machine internals -----------------------------------------------
 
-  // Streaming gate state machine:
-  //   listening  → mic on (user is being heard)
-  //   thinking   → mic off (server processing; sending more burns WS bandwidth
-  //                that TTS needs, and OpenAI ignores audio while a response
-  //                is in flight)
-  //   replying   → mic off (also avoids picking up our own TTS in case XMOS
-  //                AEC isn't perfect)
-  //   idle       → mic on for kFollowupMs so the user can answer a question
-  //                without re-triggering the wake word. Timer expiry closes
-  //                the session.
-  if (phase == "listening") {
-    if (!this->streaming_) {
-      ESP_LOGI(TAG, "phase=listening — mic streaming on");
-      this->streaming_ = true;
+bool VaClient::is_mic_streaming_() const {
+  // Single source of truth for whether on_mic_data_ should forward to the
+  // WS. Listening covers both the pre-VAD window (after wake word, before
+  // server speech_started) and the active turn. FollowupArmed runs briefly
+  // between commit_followup_mic() and the next server phase=listening.
+  return this->current_state_ == State::Listening ||
+         this->current_state_ == State::FollowupArmed;
+}
+
+void VaClient::emit_phase_(const std::string &phase) {
+  // transition_/emit_phase_ may run on the WS task; ESPHome triggers and
+  // most component APIs are not thread-safe. Marshal the trigger fire
+  // onto the main loop via defer(). We do NOT call speaker->stop() on
+  // phase changes — the speaker task runs continuously after setup() and
+  // play() just appends to its ring; stop/start churn was the root of an
+  // earlier "Parent bus is busy" race.
+  this->current_phase_ = phase;
+  std::string phase_copy = phase;
+  this->defer([this, phase_copy]() {
+    for (auto *t : this->phase_triggers_) {
+      t->trigger(phase_copy);
     }
+  });
+}
+
+void VaClient::transition_(State next, const std::string &phase_label) {
+  // One canonical helper for changing state + emitting a phase. Logs at
+  // INFO when the state actually changes so the device log shows the full
+  // lifecycle of every turn; bare LED re-renders (e.g. yaml-driven repaint
+  // requests) go through emit_phase_ directly without churning the state.
+  if (this->current_state_ != next) {
+    ESP_LOGI(TAG, "state %d -> %d (%s)", (int) this->current_state_, (int) next,
+             phase_label.c_str());
+    this->current_state_ = next;
+    this->state_entered_ms_ = millis();
+  }
+  this->emit_phase_(phase_label);
+}
+
+void VaClient::apply_server_phase_(const std::string &phase) {
+  // Server-driven phase changes. The bridge is authoritative on lifecycle
+  // (it sees the OpenAI events), so we generally trust whatever it sends.
+  // The one nuance is phase=idle: it can land while we still have seconds
+  // of TTS queued in PSRAM + downstream rings, in which case we defer the
+  // LED-idle emit and the follow-up decision until finish_drain_() fires.
+  ESP_LOGD(TAG, "server phase -> %s (state=%d)", phase.c_str(), (int) this->current_state_);
+
+  if (phase == "listening") {
 #ifdef USE_VA_CLIENT_DIAGNOSTICS
     if (this->turn_t_listening_ == 0 && this->turn_t_wake_ != 0) {
       this->turn_t_listening_ = millis();
@@ -579,125 +576,181 @@ void VaClient::set_phase_(const std::string &phase) {
     // Server heard us — watchdog no longer needed.
     this->cancel_timeout("va_no_speech");
     this->cancel_timeout("va_followup");
-  } else if (phase == "thinking" || phase == "replying") {
-    if (this->streaming_) {
-      ESP_LOGI(TAG, "phase=%s — mic streaming off", phase.c_str());
-      this->streaming_ = false;
-    }
+    this->transition_(State::Listening, "listening");
+    return;
+  }
+
+  if (phase == "thinking" || phase == "replying") {
 #ifdef USE_VA_CLIENT_DIAGNOSTICS
     if (phase == "thinking" && this->turn_t_thinking_ == 0 && this->turn_t_wake_ != 0) {
       this->turn_t_thinking_ = millis();
     }
 #endif
+    // Either of these is a real turn in progress; cancel anything
+    // related to draining or follow-up from a prior turn.
     this->cancel_timeout("va_followup");
     this->cancel_timeout("va_followup_open");
     this->cancel_timeout("va_tts_tail");
     this->cancel_timeout("va_no_speech");
-    this->followup_pending_ = false;
-    this->waiting_for_speaker_stop_ = false;
-    this->request_follow_up_pending_ = false;
-    this->followup_armed_ = false;
-    this->idle_emit_pending_ = false;  // new turn began, drop any held idle
-  } else if (phase == "idle") {
-    // Only open a follow-up window if we just finished a real turn —
-    // i.e. the previous phase was thinking or replying. Otherwise we'd
-    // open the window for every spurious idle (initial WS hello, post-
-    // disconnect idle, etc), spamming "follow-up window open" logs and
-    // opening the mic for 5s every time the device just reconnects.
-    const bool turn_just_ended = prev_phase == "thinking" || prev_phase == "replying";
-    if (!turn_just_ended) {
-      // Plain idle (boot, reconnect, etc) — no follow-up. Fall through to
-      // the regular trigger fire so the LED updates.
-    } else if (this->suppress_followup_) {
-      // send_interrupt() set this — user explicitly asked us to stop.
-      // Close the session cleanly: streaming off, no follow-up, fall through
-      // to the regular trigger fire so the LED goes idle.
-      this->suppress_followup_ = false;
-      this->streaming_ = false;
-      this->followup_pending_ = false;
-      this->waiting_for_speaker_stop_ = false;
-      this->request_follow_up_pending_ = false;
-      this->followup_armed_ = false;
-      this->cancel_timeout("va_tts_tail");
-      this->idle_emit_pending_ = false;
-    } else if (this->audio_fill_ == 0) {
-      // Server says response.done and the device has actually played out.
-      // Open the follow-up window (mic on so user can answer a question).
-      this->open_followup_window_();
-      // fall through to fire the trigger normally below
-    } else {
-      // Server says response.done, but we still have seconds of TTS queued
-      // in PSRAM + downstream rings. Two things wait on the queue:
-      //   1) the LED transition to idle (otherwise it goes off while the
-      //      device is still speaking)
-      //   2) opening the follow-up mic window (echo + false VAD trigger)
-      // Mark both pending; the drain handler in loop() releases them
-      // together after the speaker actually finishes.
-      ESP_LOGI(TAG, "phase=idle but %u bytes still queued; LED + follow-up deferred",
-               (unsigned) this->audio_fill_);
-      this->followup_pending_ = true;
-      this->idle_emit_pending_ = true;
-      return;  // suppress immediate trigger fire — open_followup_window_ will fire it later
-    }
+    this->request_follow_up_for_next_turn_ = false;
+    this->transition_(phase == "thinking" ? State::Thinking : State::Replying, phase);
+    return;
   }
 
-  // set_phase_ may be called from the websocket task; ESPHome triggers and
-  // most component APIs are not thread-safe. Marshal the side effects onto
-  // the main loop via defer().
-  std::string phase_copy = phase;
-  this->defer([this, phase_copy]() {
-    // We deliberately do NOT call speaker->stop() on "listening" anymore:
-    // the speaker task runs continuously after setup() and play() just
-    // appends to its ring buffer. Stop/start churn was creating multiple
-    // speaker_task instances racing for the i2s channel ("Parent bus is
-    // busy"). For barge-in/interrupt we'll add a buffer-flush API in M3.
-    for (auto *t : this->phase_triggers_) {
-      t->trigger(phase_copy);
+  if (phase == "idle") {
+    // The interesting case. The state we're coming FROM dictates what
+    // "idle" means.
+    const State from = this->current_state_;
+    const bool turn_just_ended = (from == State::Thinking || from == State::Replying);
+
+    if (!turn_just_ended) {
+      // Spurious idle from outside a turn (initial hello, post-disconnect).
+      // Just sync the LED — no drain wait, no follow-up consideration.
+      this->transition_(State::Idle, "idle");
+      return;
     }
-  });
+
+    if (this->interrupt_pending_) {
+      // User barge-cancelled. Clean close, no drain wait (send_interrupt
+      // already flushed the ring), no follow-up.
+      this->interrupt_pending_ = false;
+      this->request_follow_up_for_next_turn_ = false;
+      this->cancel_timeout("va_tts_tail");
+      this->transition_(State::Idle, "idle");
+      return;
+    }
+
+    // Real end of turn. If everything has already played out we can go
+    // straight to the post-turn decision (open follow-up vs Idle).
+    // Otherwise enter WaitingDrain and let loop() drive finish_drain_()
+    // when the speaker chain actually empties.
+    if (this->audio_fill_ == 0) {
+      this->current_state_ = State::WaitingDrain;
+      this->state_entered_ms_ = millis();
+      this->finish_drain_();
+      return;
+    }
+    ESP_LOGI(TAG, "phase=idle but %u bytes still queued; LED + follow-up deferred",
+             (unsigned) this->audio_fill_);
+    this->current_state_ = State::WaitingDrain;
+    this->state_entered_ms_ = millis();
+    // No LED emit here — finish_drain_() will fire it once the chain drains.
+    return;
+  }
+
+  ESP_LOGD(TAG, "ignoring unknown server phase '%s'", phase.c_str());
+}
+
+void VaClient::finish_drain_() {
+  // Called from loop() once the PSRAM ring AND the downstream speaker
+  // chain have both drained (or kSpeakerStopTimeoutMs elapsed). This is
+  // the post-turn decision point: emit the deferred LED-idle, then either
+  // open a follow-up mic window (request_follow_up case or kFollowupMs > 0)
+  // or go straight to Idle.
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
+  if (this->turn_t_wake_ != 0) {
+    uint32_t now = millis();
+    auto fmt = [](uint32_t from, uint32_t to) -> std::string {
+      if (from == 0 || to == 0 || to < from)
+        return "?";
+      return std::to_string(to - from) + "ms";
+    };
+    ESP_LOGI(TAG,
+             "turn latency: wake→listening=%s listening→thinking=%s "
+             "thinking→first_audio=%s first_audio→played_out=%s "
+             "total=%s",
+             fmt(this->turn_t_wake_, this->turn_t_listening_).c_str(),
+             fmt(this->turn_t_listening_, this->turn_t_thinking_).c_str(),
+             fmt(this->turn_t_thinking_, this->turn_t_first_audio_out_).c_str(),
+             fmt(this->turn_t_first_audio_out_, now).c_str(),
+             fmt(this->turn_t_wake_, now).c_str());
+    if (this->ws_gap_count_ > 0 || this->clipped_samples_ > 0 ||
+        this->underrun_logged_this_turn_) {
+      ESP_LOGW(TAG,
+               "turn audio: ws_gaps=%u (max=%ums) clipped_samples=%u underrun=%s",
+               (unsigned) this->ws_gap_count_,
+               (unsigned) this->ws_gap_max_ms_,
+               (unsigned) this->clipped_samples_,
+               this->underrun_logged_this_turn_ ? "yes" : "no");
+    }
+    this->turn_t_wake_ = 0;  // mark turn as logged
+  }
+#endif
+
+  if (this->request_follow_up_for_next_turn_) {
+    // Server explicitly asked us to keep the mic open for an answer.
+    // yaml plays the chime via on_followup_opened, then calls
+    // commit_followup_mic() once the chime + i2s tail is fully out.
+    this->request_follow_up_for_next_turn_ = false;
+    this->transition_(State::FollowupArmed, "idle");
+    ESP_LOGI(TAG, "follow-up requested — firing on_followup_opened");
+    this->defer([this]() {
+      for (auto *t : this->followup_opened_triggers_) {
+        t->trigger();
+      }
+    });
+    return;
+  }
+
+  if (kFollowupMs > 0) {
+    // Implicit follow-up window after every reply (XMOS AEC permitting).
+    // Currently kFollowupMs is 0 so this branch never runs — kept so a
+    // future re-enable is one constant flip rather than a state-machine
+    // rewrite.
+    this->transition_(State::FollowupArmed, "listening");
+    ESP_LOGI(TAG, "implicit follow-up window open (%u ms)", (unsigned) kFollowupMs);
+    this->set_timeout("va_followup", kFollowupMs, [this]() {
+      if (this->current_state_ == State::FollowupArmed) {
+        ESP_LOGI(TAG, "follow-up window expired");
+        this->transition_(State::Idle, "idle");
+      }
+    });
+    return;
+  }
+
+  // Default path: no follow-up. Close the turn cleanly.
+  this->transition_(State::Idle, "idle");
 }
 
 void VaClient::start_session() {
-  // Open the streaming window. on_mic_data_ will start forwarding frames to
-  // the server until "phase":"idle" comes back (response.done). Without this
-  // gate, OpenAI Realtime's server VAD would respond to any speech in the
-  // room — wake word would be cosmetic.
+  // Wake-word handler in yaml routes here. Open the mic so on_mic_data_
+  // starts forwarding to the server. Without this gate, OpenAI Realtime's
+  // server VAD would respond to any speech in the room and the wake word
+  // would be cosmetic.
 
-  // Belt-and-suspenders barge-in. The yaml wake handler calls send_interrupt()
-  // when it observes voice_assistant_phase == replying, but two windows slip
-  // past that check:
-  //   1) server already sent phase=idle yet PSRAM still has seconds of TTS
-  //      queued (idle_emit_pending_). yaml's voice_assistant_phase has been
-  //      reset to idle and the wake handler takes the "fresh session" path —
-  //      no interrupt — so the new reply overlaps with the tail of the old.
+  // Belt-and-suspenders barge-in. The yaml wake handler also calls
+  // send_interrupt() when it observes voice_assistant_phase == replying,
+  // but two windows slip past that check:
+  //   1) server already sent phase=idle yet PSRAM still has TTS queued
+  //      (state == WaitingDrain). yaml's voice_assistant_phase has been
+  //      reset to idle and the wake handler takes the "fresh session"
+  //      path — no interrupt — so the new reply overlaps with the tail
+  //      of the old.
   //   2) wake fires mid-reply on a long answer where the server is still
-  //      generating tokens; without an interrupt, OpenAI keeps streaming TTS
-  //      we'll never play, burning tokens.
+  //      generating tokens; without an interrupt, OpenAI keeps streaming
+  //      TTS we'll never play, burning tokens.
   // The bridge treats interrupt as cheap when there's nothing to cancel
   // (response_cancel_not_active is in its benignCodes set), and
-  // input_audio_buffer.clear is safe here because mic frames for the new turn
-  // don't start flowing until after this function returns.
+  // input_audio_buffer.clear is safe here because mic frames for the new
+  // turn don't start flowing until after this function returns.
   const bool residual_reply =
       this->audio_fill_ > 0 ||
-      this->idle_emit_pending_ ||
-      this->current_phase_ == "replying" ||
-      this->current_phase_ == "thinking";
+      this->current_state_ == State::Thinking ||
+      this->current_state_ == State::Replying ||
+      this->current_state_ == State::WaitingDrain;
   if (residual_reply) {
-    ESP_LOGI(TAG, "start_session: interrupting residual reply (phase=%s, fill=%u)",
-             this->current_phase_.c_str(), (unsigned) this->audio_fill_);
+    ESP_LOGI(TAG, "start_session: interrupting residual reply (state=%d, fill=%u)",
+             (int) this->current_state_, (unsigned) this->audio_fill_);
     this->send_interrupt();
   }
 
-  ESP_LOGI(TAG, "start_session() — streaming on");
-  this->streaming_ = true;
-  // New wake word starts a fresh session — drop any pending or active
-  // follow-up window from the previous turn.
-  this->followup_pending_ = false;
-  this->waiting_for_speaker_stop_ = false;
-  this->request_follow_up_pending_ = false;
-  this->followup_armed_ = false;
-  this->idle_emit_pending_ = false;
-  this->suppress_followup_ = false;
+  // Wake starts a fresh session — drop any pending modifier flags from
+  // the previous turn. State transition takes us to Listening; the
+  // pending side-channels are reset here so the next phase=idle from the
+  // server is interpreted as a fresh end-of-turn rather than a delayed
+  // signal from the old one.
+  this->request_follow_up_for_next_turn_ = false;
+  this->interrupt_pending_ = false;
   this->cancel_timeout("va_followup");
   this->cancel_timeout("va_followup_open");
   this->cancel_timeout("va_tts_tail");
@@ -714,9 +767,13 @@ void VaClient::start_session() {
   this->clipped_samples_ = 0;
   this->underrun_logged_this_turn_ = false;
 #endif
-  // Watchdog: if server doesn't hear us within kNoSpeechTimeoutMs, abort the
-  // session so we're not stuck with the mic open after a misfire.
+  this->transition_(State::Listening, "listening");
+  // Watchdog: if server doesn't hear us within kNoSpeechTimeoutMs, abort
+  // the session so we're not stuck with the mic open after a misfire.
   this->set_timeout("va_no_speech", kNoSpeechTimeoutMs, [this]() {
+    if (this->current_state_ != State::Listening) {
+      return;  // turn already progressed past Listening; nothing to do
+    }
     ESP_LOGI(TAG, "no speech detected for %u ms — aborting session",
              (unsigned) kNoSpeechTimeoutMs);
     if (this->ws_connected_ && this->ws_handle_ != nullptr) {
@@ -724,78 +781,10 @@ void VaClient::start_session() {
       auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
       esp_websocket_client_send_text(handle, m, sizeof(m) - 1, portMAX_DELAY);
     }
-    this->streaming_ = false;
 #ifdef USE_VA_CLIENT_DIAGNOSTICS
     this->turn_t_wake_ = 0;
 #endif
-    // Force LED back to idle from yaml side.
-    this->defer([this]() {
-      for (auto *t : this->phase_triggers_) {
-        t->trigger("idle");
-      }
-    });
-  });
-}
-
-void VaClient::open_followup_window_(uint32_t duration_ms) {
-  // If a phase=idle LED transition was held back while audio drained, fire
-  // it now so the LED goes to idle in sync with the speaker actually going
-  // quiet (instead of as soon as the server emitted response.done).
-  if (this->idle_emit_pending_) {
-    this->idle_emit_pending_ = false;
-    this->defer([this]() {
-      for (auto *t : this->phase_triggers_) {
-        t->trigger("idle");
-      }
-    });
-#ifdef USE_VA_CLIENT_DIAGNOSTICS
-    // Per-turn latency summary. Anchors are zero if we skipped a milestone
-    // (e.g. interrupt mid-reply); show "?" so the line stays readable.
-    if (this->turn_t_wake_ != 0) {
-      uint32_t now = millis();
-      auto fmt = [](uint32_t from, uint32_t to) -> std::string {
-        if (from == 0 || to == 0 || to < from)
-          return "?";
-        return std::to_string(to - from) + "ms";
-      };
-      ESP_LOGI(TAG,
-               "turn latency: wake→listening=%s listening→thinking=%s "
-               "thinking→first_audio=%s first_audio→played_out=%s "
-               "total=%s",
-               fmt(this->turn_t_wake_, this->turn_t_listening_).c_str(),
-               fmt(this->turn_t_listening_, this->turn_t_thinking_).c_str(),
-               fmt(this->turn_t_thinking_, this->turn_t_first_audio_out_).c_str(),
-               fmt(this->turn_t_first_audio_out_, now).c_str(),
-               fmt(this->turn_t_wake_, now).c_str());
-      // Audio-quality summary: only logged if anything anomalous fired.
-      // A clean turn produces no line — keeps the noise floor low.
-      if (this->ws_gap_count_ > 0 || this->clipped_samples_ > 0 ||
-          this->underrun_logged_this_turn_) {
-        ESP_LOGW(TAG,
-                 "turn audio: ws_gaps=%u (max=%ums) clipped_samples=%u underrun=%s",
-                 (unsigned) this->ws_gap_count_,
-                 (unsigned) this->ws_gap_max_ms_,
-                 (unsigned) this->clipped_samples_,
-                 this->underrun_logged_this_turn_ ? "yes" : "no");
-      }
-      this->turn_t_wake_ = 0;  // mark turn as logged
-    }
-#endif
-  }
-  if (duration_ms == 0) {
-    // Follow-up disabled for this call: turn-based behaviour like the
-    // original pipeline. Leave the mic closed; user must say a wake word
-    // for the next turn.
-    this->streaming_ = false;
-    return;
-  }
-  ESP_LOGI(TAG, "follow-up window open (mic on for %u ms)", (unsigned) duration_ms);
-  this->streaming_ = true;
-  this->set_timeout("va_followup", duration_ms, [this]() {
-    if (this->streaming_) {
-      ESP_LOGI(TAG, "follow-up window expired — mic streaming off");
-      this->streaming_ = false;
-    }
+    this->transition_(State::Idle, "idle");
   });
 }
 
@@ -803,21 +792,21 @@ void VaClient::commit_followup_mic() {
   // Called from yaml's on_followup_opened automation once the chime has
   // finished playing AND the i2s tail has cleared (wait_until + delay).
   // If anything pre-empted us between trigger fire and here (a fresh
-  // wake word, a Stop, send_interrupt, or a new turn starting) the
-  // armed flag was cleared — silently no-op so we don't reopen the mic
-  // out of nowhere.
-  if (!this->followup_armed_) {
-    ESP_LOGD(TAG, "commit_followup_mic: not armed, ignoring");
+  // wake word, a Stop, send_interrupt, or a new turn starting) the state
+  // already moved out of FollowupArmed — silently no-op so we don't
+  // reopen the mic out of nowhere.
+  if (this->current_state_ != State::FollowupArmed) {
+    ESP_LOGD(TAG, "commit_followup_mic: state=%d, ignoring",
+             (int) this->current_state_);
     return;
   }
-  this->followup_armed_ = false;
   ESP_LOGI(TAG, "follow-up mic armed by yaml (window %u ms)",
            (unsigned) kRequestFollowUpMs);
-  this->streaming_ = true;
+  this->transition_(State::Listening, "listening");
   this->set_timeout("va_followup", kRequestFollowUpMs, [this]() {
-    if (this->streaming_) {
-      ESP_LOGI(TAG, "follow-up window expired — mic streaming off");
-      this->streaming_ = false;
+    if (this->current_state_ == State::Listening) {
+      ESP_LOGI(TAG, "follow-up window expired");
+      this->transition_(State::Idle, "idle");
     }
   });
 }
@@ -833,28 +822,24 @@ void VaClient::send_interrupt() {
   // Flush our PSRAM playback queue — what's already been pushed into the
   // resampler/mixer/leaf will still drain (~600 ms residual), but everything
   // we have yet to hand off is dropped. The yaml side stops the resampler
-  // explicitly. Reset deferred state too so we don't accidentally hold an
-  // "idle" emit waiting for the (now-empty) queue. The ring reset has to
-  // happen under the mux: the WS task could be mid-write and seeing
-  // head=tail=fill=0 partway through would let it write into a "freshly
-  // empty" buffer the user just barge-cancelled.
+  // explicitly. The ring reset has to happen under the mux: the WS task
+  // could be mid-write and seeing head=tail=fill=0 partway through would
+  // let it write into a "freshly empty" buffer the user just barge-
+  // cancelled.
   portENTER_CRITICAL(&this->ring_mux_);
   this->audio_head_ = 0;
   this->audio_tail_ = 0;
   this->audio_fill_ = 0;
   portEXIT_CRITICAL(&this->ring_mux_);
-  this->followup_pending_ = false;
-  this->waiting_for_speaker_stop_ = false;
-  this->request_follow_up_pending_ = false;
-  this->followup_armed_ = false;
-  this->idle_emit_pending_ = false;
+  this->request_follow_up_for_next_turn_ = false;
   this->cancel_timeout("va_no_speech");
   this->cancel_timeout("va_followup");
-  this->cancel_timeout("va_tts_tail");
-  // The phase=idle the server is about to send shouldn't open a follow-up
-  // mic window — the user said "stop", not "wait for me to keep talking".
-  this->suppress_followup_ = true;
   this->cancel_timeout("va_followup_open");
+  this->cancel_timeout("va_tts_tail");
+  // The phase=idle the server is about to send shouldn't open a follow-
+  // up mic window — user said "stop", not "wait for me to keep talking".
+  // apply_server_phase_("idle") consumes this on the next idle.
+  this->interrupt_pending_ = true;
   ESP_LOGI(TAG, "send_interrupt — WS msg sent, queue flushed");
 }
 
