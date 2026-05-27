@@ -1,5 +1,6 @@
 #pragma once
 
+#include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/speaker/speaker.h"
@@ -14,9 +15,31 @@
 namespace esphome {
 namespace va_client {
 
-class OnPhaseTrigger;
-class OnRepeatedFailureTrigger;
-class OnFollowupOpenedTrigger;
+class VaClient;
+
+// Triggers live as nested-style siblings of VaClient — declared here so the
+// schema-side codegen can reference the same fully-qualified names. They
+// register themselves with the parent via add_*_trigger() so the yaml-
+// generated trigger lifecycle stays standard.
+
+class OnPhaseTrigger : public Trigger<std::string> {
+ public:
+  explicit OnPhaseTrigger(VaClient *parent);
+};
+
+class OnRepeatedFailureTrigger : public Trigger<> {
+ public:
+  explicit OnRepeatedFailureTrigger(VaClient *parent);
+};
+
+// Fires when the device opens a follow-up mic window (i.e. server's
+// request_follow_up message landed and the audio buffer has drained).
+// yaml uses this to play the wake chime + flip the LED to "listening"
+// so the user knows the assistant is waiting for their answer.
+class OnFollowupOpenedTrigger : public Trigger<> {
+ public:
+  explicit OnFollowupOpenedTrigger(VaClient *parent);
+};
 
 class VaClient : public Component {
  public:

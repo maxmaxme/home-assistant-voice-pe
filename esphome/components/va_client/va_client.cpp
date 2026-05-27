@@ -1,5 +1,4 @@
 #include "va_client.h"
-#include "automation.h"
 
 #include "esphome/core/log.h"
 #include "esphome/components/audio/audio.h"
@@ -14,6 +13,20 @@ namespace esphome {
 namespace va_client {
 
 static const char *const TAG = "va_client";
+
+// Trigger constructors — registered against their parent VaClient so the
+// yaml-generated trigger lifecycle stays standard. Definitions live here
+// rather than inline in the header to break the otherwise-circular
+// dependency between trigger ctor and VaClient::add_*_trigger().
+OnPhaseTrigger::OnPhaseTrigger(VaClient *parent) {
+  parent->add_on_phase_trigger(this);
+}
+OnRepeatedFailureTrigger::OnRepeatedFailureTrigger(VaClient *parent) {
+  parent->add_on_repeated_failure_trigger(this);
+}
+OnFollowupOpenedTrigger::OnFollowupOpenedTrigger(VaClient *parent) {
+  parent->add_on_followup_opened_trigger(this);
+}
 
 // Free-function trampoline. esp-idf event registration takes a C function
 // pointer; we recover the VaClient* from the user_data slot.
