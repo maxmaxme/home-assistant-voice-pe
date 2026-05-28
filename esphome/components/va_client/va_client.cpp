@@ -257,9 +257,10 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
         }
       });
 
-      const char start_msg[] = "{\"type\":\"start\"}";
-      auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-      esp_websocket_client_send_text(handle, start_msg, sizeof(start_msg) - 1, portMAX_DELAY);
+      // NOTE: we no longer send {"type":"start"} here. `start` means "a turn
+      // is beginning" and is now sent from start_session() (wake word) so the
+      // bridge flips to the listening phase at wake, not at connect. A fresh
+      // connection just parks in idle.
       this->apply_server_phase_("idle");
       break;
     }
@@ -718,31 +719,13 @@ void VaClient::start_session() {
   // server VAD would respond to any speech in the room and the wake word
   // would be cosmetic.
 
-  // Belt-and-suspenders barge-in. The yaml wake handler also calls
-  // send_interrupt() when it observes voice_assistant_phase == replying,
-  // but two windows slip past that check:
-  //   1) server already sent phase=idle yet PSRAM still has TTS queued
-  //      (state == WaitingDrain). yaml's voice_assistant_phase has been
-  //      reset to idle and the wake handler takes the "fresh session"
-  //      path — no interrupt — so the new reply overlaps with the tail
-  //      of the old.
-  //   2) wake fires mid-reply on a long answer where the server is still
-  //      generating tokens; without an interrupt, OpenAI keeps streaming
-  //      TTS we'll never play, burning tokens.
-  // The bridge treats interrupt as cheap when there's nothing to cancel
-  // (response_cancel_not_active is in its benignCodes set), and
-  // input_audio_buffer.clear is safe here because mic frames for the new
-  // turn don't start flowing until after this function returns.
-  const bool residual_reply =
-      this->audio_fill_ > 0 ||
-      this->current_state_ == State::Thinking ||
-      this->current_state_ == State::Replying ||
-      this->current_state_ == State::WaitingDrain;
-  if (residual_reply) {
-    ESP_LOGI(TAG, "start_session: interrupting residual reply (state=%d, fill=%u)",
-             (int) this->current_state_, (unsigned) this->audio_fill_);
-    this->send_interrupt();
-  }
+  // Barge-in is now carried by `start` itself: send_start_() (below) tells the
+  // bridge a new turn is beginning, and the bridge cancels any reply still in
+  // flight and clears its input buffer. We no longer send a separate
+  // {"type":"interrupt"} here — interrupt means "abort to idle" (Stop / no-
+  // speech), not "new turn". This kills the two windows that used to leak the
+  // tail of an old reply into a new one (server already idle but PSRAM still
+  // queued; long answer still generating) without the extra round-trip.
 
   // Wake starts a fresh session — drop any pending modifier flags from
   // the previous turn. State transition takes us to Listening; the
@@ -767,6 +750,9 @@ void VaClient::start_session() {
   this->clipped_samples_ = 0;
   this->underrun_logged_this_turn_ = false;
 #endif
+  // Tell the bridge a turn is starting so it flips to the listening phase
+  // now, rather than lagging until OpenAI's server VAD reports speech.
+  this->send_start_();
   this->transition_(State::Listening, "listening");
   // Watchdog: if server doesn't hear us within kNoSpeechTimeoutMs, abort
   // the session so we're not stuck with the mic open after a misfire.
@@ -841,6 +827,17 @@ void VaClient::send_interrupt() {
   // apply_server_phase_("idle") consumes this on the next idle.
   this->interrupt_pending_ = true;
   ESP_LOGI(TAG, "send_interrupt — WS msg sent, queue flushed");
+}
+
+void VaClient::send_start_() {
+  if (!this->ws_connected_ || this->ws_handle_ == nullptr) {
+    ESP_LOGW(TAG, "send_start_: WS not connected");
+    return;
+  }
+  const char msg[] = "{\"type\":\"start\"}";
+  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+  esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
+  ESP_LOGD(TAG, "send_start_ — WS msg sent");
 }
 
 }  // namespace va_client

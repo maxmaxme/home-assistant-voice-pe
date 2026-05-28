@@ -1914,9 +1914,12 @@ micro_wake_word:
                           condition:
                             lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
                           then:
-                            # Interrupt the active reply. Flush the queue +
-                            # stop the resampler so audio cuts immediately.
-                            - lambda: 'id(va)->send_interrupt();'
+                            # Barge-in. Stop the local resampler so audio cuts
+                            # immediately; the server-side cancel is carried by
+                            # start_session()'s `start` message below (the
+                            # bridge cancels the in-flight reply on `start`).
+                            # We no longer send a separate interrupt here —
+                            # interrupt now means "abort to idle", not "barge".
                             - speaker.stop:
                                 id: media_resampling_speaker
                             # Play the same wake chime as fresh-session so the
@@ -1943,12 +1946,11 @@ micro_wake_word:
                                   # off the mic so XMOS AEC doesn't leak it
                                   # back as "Ok, nabu" into the new turn.
                                   - delay: 400ms
-                            # Open the mic locally. Used to rely on the
-                            # bridge echoing phase=listening after interrupt;
-                            # bridge no longer does that (it would also pop
-                            # the mic open after a Stop), so we drive it
-                            # explicitly here. start_session() is idempotent
-                            # against the send_interrupt() above.
+                            # Open the mic locally and tell the bridge a new
+                            # turn is starting. start_session() sends `start`,
+                            # which the bridge turns into "cancel the in-flight
+                            # reply + go to listening" — so this single call
+                            # both barges in and reopens the mic.
                             - lambda: 'id(va)->start_session();'
                             - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
                             - script.execute: control_leds
@@ -1973,9 +1975,9 @@ micro_wake_word:
                                   # Regular wake word: play wake chime, start a new session.
                                   # Stop the TTS playback chain first. The previous turn may
                                   # still have downstream ring residual (~600 ms) even after
-                                  # the server said phase=idle — start_session()'s internal
-                                  # send_interrupt() flushes the PSRAM queue, but the leaf's
-                                  # own ring buffers it can't reach. Without this stop the
+                                  # the server said phase=idle — the `start` we send next makes
+                                  # the bridge cancel upstream + flush its side, but the local
+                                  # leaf ring buffers it can't reach. Without this stop the
                                   # tail of the old reply leaks under the wake chime.
                                   # No-op when there's nothing playing.
                                   - speaker.stop:

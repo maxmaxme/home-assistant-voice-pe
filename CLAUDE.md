@@ -71,8 +71,10 @@ JSON messages (text frames) interleaved with binary PCM16:
 
 - **server → device**: `hello` (handshake ack), `phase` (state transition),
   `error`, `pong`.
-- **device → server**: `start` (begin a turn), `interrupt` (barge-in),
-  `ping`.
+- **device → server**: `start` (begin a turn — also barges in: the bridge
+  cancels any reply still in flight on `start`), `interrupt` (abort the
+  current turn back to idle — Stop wake word, center-button cancel, or the
+  no-speech watchdog; NOT used for barge-in), `ping`.
 
 Defined in voice-assistant's `src/realtime/protocol.ts` — keep both
 sides in lockstep when changing it.

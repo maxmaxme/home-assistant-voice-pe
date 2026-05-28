@@ -107,6 +107,13 @@ class VaClient : public Component {
   void on_mic_data_(const std::vector<uint8_t> &samples);
   void handle_text_(const char *data, size_t len);
   void handle_binary_(const uint8_t *data, size_t len);
+  // Send {"type":"start"} — the "a turn is beginning" signal. Sent from
+  // start_session() (wake word), so the bridge can flip to the listening
+  // phase immediately instead of waiting for OpenAI's server-VAD
+  // speech_started. Also covers barge-in: the bridge cancels any reply still
+  // in flight on `start`, so we don't send a separate interrupt to barge.
+  // No-op if the WS isn't connected.
+  void send_start_();
   // Move the state machine to `next` and emit a phase LED transition to
   // `phase_label` (the user-visible name passed to yaml triggers). Stamps
   // state_entered_ms_ so state-bound timers can reference it.
