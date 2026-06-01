@@ -1917,12 +1917,21 @@ micro_wake_word:
                           condition:
                             lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
                           then:
-                            # Barge-in. Stop the local resampler so audio cuts
-                            # immediately; the server-side cancel is carried by
+                            # Barge-in. Drop the queued TTS still sitting in
+                            # va_client's PSRAM ring AND stop the downstream
+                            # resampler so audio cuts immediately. Both are
+                            # needed: speaker.stop alone is undone on the next
+                            # loop() tick, which re-feeds the un-flushed ring
+                            # into the speaker — so the old reply would keep
+                            # playing under the wake chime and then the new
+                            # reply would stack behind it (the "two voices
+                            # overlapping" bug). Flush first so nothing is left
+                            # to re-feed. The server-side cancel is carried by
                             # start_session()'s `start` message below (the
                             # bridge cancels the in-flight reply on `start`).
                             # We no longer send a separate interrupt here —
                             # interrupt now means "abort to idle", not "barge".
+                            - lambda: 'id(va)->flush_audio_queue();'
                             - speaker.stop:
                                 id: media_resampling_speaker
                             # Play the same wake chime as fresh-session so the

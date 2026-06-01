@@ -72,6 +72,14 @@ class VaClient : public Component {
   // YAML-callable actions.
   void start_session();
   void send_interrupt();
+  // Drop any TTS audio still queued in the PSRAM playback ring (head/tail/
+  // fill = 0). Whatever already reached the downstream resampler/mixer leaf
+  // still drains (~600 ms residual); the yaml stops that chain explicitly.
+  // Called from yaml at barge-in (wake word during a reply) so the old
+  // reply's queued tail can't keep draining under the wake chime before
+  // start_session() runs, and folded into start_session()/send_interrupt()
+  // as a backstop. Safe to call when the ring is already empty (no-op).
+  void flush_audio_queue();
   // Called from yaml's on_followup_opened automation AFTER the chime has
   // finished announcing through the speaker (wait_until !is_announcing +
   // i2s tail). Opens the mic for kRequestFollowUpMs. No-op if the device
