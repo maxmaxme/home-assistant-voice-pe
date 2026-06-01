@@ -1760,6 +1760,9 @@ udp_log:
 
 va_client:
   id: va
+  # Temporarily enabled to capture ws-gap / downstream-underrun warnings
+  # while chasing an intermittent speaker hiss. Drop back once diagnosed.
+  diagnostics: true
   url: ${va_url}
   token: !secret va_device_token
   microphone: i2s_mics
