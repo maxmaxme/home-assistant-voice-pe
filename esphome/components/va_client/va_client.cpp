@@ -429,8 +429,9 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   size_t pairs = len / 2;
   if (pairs > 0) {
     auto *in = reinterpret_cast<const int16_t *>(data);
-    // Reuse mono_buf_ as a scratch — it's already int16_t.
-    this->mono_buf_.resize(pairs);
+    // Playback path's OWN scratch — never mono_buf_, which the mic task owns.
+    // Sharing it raced resize() across two tasks (see va_client.h note).
+    this->play_buf_.resize(pairs);
     float vol = this->volume_;
     if (vol < 0.0f) vol = 0.0f;
     else if (vol > 1.0f) vol = 1.0f;
@@ -452,12 +453,12 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
         clipped++;
 #endif
       }
-      this->mono_buf_[i] = static_cast<int16_t>(v);
+      this->play_buf_[i] = static_cast<int16_t>(v);
     }
 #ifdef USE_VA_CLIENT_DIAGNOSTICS
     this->clipped_samples_ += clipped;
 #endif
-    data = reinterpret_cast<const uint8_t *>(this->mono_buf_.data());
+    data = reinterpret_cast<const uint8_t *>(this->play_buf_.data());
     // len is unchanged (pairs * 2 == len rounded down; trailing odd byte ignored).
     len = pairs * 2;
   }

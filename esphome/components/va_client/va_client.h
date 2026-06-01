@@ -185,7 +185,15 @@ class VaClient : public Component {
   static constexpr uint32_t kStableConnectionMs = 30000;
 
   // Scratch buffers reused on the hot path to avoid per-callback heap allocation.
-  std::vector<int16_t> mono_buf_;
+  // These MUST stay separate: mono_buf_ is owned by the MIC path (on_mic_data_,
+  // microphone task) and play_buf_ by the PLAYBACK path (handle_binary_,
+  // websocket task). The two run on different FreeRTOS tasks with no lock around
+  // the scratch, so sharing one vector let resize() realloc the backing store
+  // out from under the other task during barge-in (mic open while the bridge
+  // still flushes a cancelled reply's tail audio) — read as int16 samples that
+  // is full-scale garbage, i.e. an intermittent loud speaker hiss.
+  std::vector<int16_t> mono_buf_;  // mic task only
+  std::vector<int16_t> play_buf_;  // websocket task only
 
   // Follow-up dialog window after a real turn ends. 0 disables — mic
   // closes immediately after each reply, like the original turn-based
