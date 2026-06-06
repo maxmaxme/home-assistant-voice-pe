@@ -738,6 +738,17 @@ void VaClient::start_session() {
   this->cancel_timeout("va_followup");
   this->cancel_timeout("va_followup_open");
   this->cancel_timeout("va_tts_tail");
+  // Barge-in: a wake word fired while a previous reply was still playing.
+  // The `start` we send below cancels the reply upstream, but the bytes
+  // already burst into our PSRAM ring would otherwise keep draining into
+  // the speaker (loop() feeds the ring regardless of state) and the new
+  // reply's audio would be appended behind them — the user hears the old
+  // answer continue, then the new one. Drop the queued tail now so only
+  // the new turn's audio plays. The yaml stops the downstream resampler
+  // chain alongside this call; on a fresh wake from idle the ring is
+  // already empty and this is a no-op (the yaml barge-in path also flushes
+  // up front, before the wake chime, so this is usually a backstop).
+  this->flush_audio_queue();
 #ifdef USE_VA_CLIENT_DIAGNOSTICS
   // Anchor turn-latency timestamps for the new turn.
   this->turn_t_wake_ = millis();
@@ -809,15 +820,8 @@ void VaClient::send_interrupt() {
   // Flush our PSRAM playback queue — what's already been pushed into the
   // resampler/mixer/leaf will still drain (~600 ms residual), but everything
   // we have yet to hand off is dropped. The yaml side stops the resampler
-  // explicitly. The ring reset has to happen under the mux: the WS task
-  // could be mid-write and seeing head=tail=fill=0 partway through would
-  // let it write into a "freshly empty" buffer the user just barge-
-  // cancelled.
-  portENTER_CRITICAL(&this->ring_mux_);
-  this->audio_head_ = 0;
-  this->audio_tail_ = 0;
-  this->audio_fill_ = 0;
-  portEXIT_CRITICAL(&this->ring_mux_);
+  // explicitly.
+  this->flush_audio_queue();
   this->request_follow_up_for_next_turn_ = false;
   this->cancel_timeout("va_no_speech");
   this->cancel_timeout("va_followup");
@@ -839,6 +843,22 @@ void VaClient::send_start_() {
   auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
   esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
   ESP_LOGD(TAG, "send_start_ — WS msg sent");
+}
+
+void VaClient::flush_audio_queue() {
+  // The ring reset has to happen under the mux: handle_binary_ runs on the
+  // WS task and could be mid-write — seeing head=tail=fill=0 partway through
+  // would let it commit a tail/fill that index into a buffer we just cleared.
+  size_t dropped;
+  portENTER_CRITICAL(&this->ring_mux_);
+  dropped = this->audio_fill_;
+  this->audio_head_ = 0;
+  this->audio_tail_ = 0;
+  this->audio_fill_ = 0;
+  portEXIT_CRITICAL(&this->ring_mux_);
+  if (dropped > 0) {
+    ESP_LOGD(TAG, "flushed %u bytes of queued playback audio", (unsigned) dropped);
+  }
 }
 
 }  // namespace va_client
