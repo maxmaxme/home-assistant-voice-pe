@@ -16,6 +16,17 @@ namespace va_client {
 
 static const char *const TAG = "va_client";
 
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
+// Loud-garbage detector thresholds. A PCM16 chunk where most samples sit near
+// full scale is noise, not speech (speech peaks but doesn't sustain near
+// ±32767). We measure at two points — the chunk just received over the WS, and
+// the slice about to be handed to the speaker — so we can tell whether garbage
+// arrived over the wire (upstream / OpenAI) or was introduced device-side
+// (ring / scaling / a cross-task race) between receipt and playback.
+static constexpr int32_t kNoiseLevel = 19660;  // ~0.6 * 32767
+static constexpr float kNoiseRatio = 0.5f;     // share of samples above level
+#endif
+
 // Trigger constructors — registered against their parent VaClient so the
 // yaml-generated trigger lifecycle stays standard. Definitions live here
 // rather than inline in the header to break the otherwise-circular
@@ -117,6 +128,32 @@ void VaClient::loop() {
                    (unsigned) (fill - accepted));
           dbg_last = now;
         }
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
+        // Scan the slice we just handed to the speaker. [head, head+accepted)
+        // is contiguous (contiguous never wraps), so a linear read is safe.
+        // If this is noise-like but the matching incoming chunk was NOT, the
+        // garbage was introduced device-side between receipt and playback
+        // (ring write / scaling / a cross-task race) rather than over the wire.
+        {
+          const int16_t *pb = reinterpret_cast<const int16_t *>(this->audio_buf_ + head);
+          size_t ns = accepted / 2;
+          uint32_t loud = 0, scanned = 0;
+          for (size_t i = 0; i < ns; i += 4) {  // sample every 4th frame
+            if (pb[i] > kNoiseLevel || pb[i] < -kNoiseLevel) loud++;
+            scanned++;
+          }
+          if (scanned > 0 && static_cast<float>(loud) / static_cast<float>(scanned) >= kNoiseRatio) {
+            static uint32_t noise_pb_last = 0;
+            if (now - noise_pb_last >= 200) {
+              ESP_LOGW(TAG,
+                       "playback noise-like slice: %u/%u near full scale (state=%d fill=%u)",
+                       (unsigned) loud, (unsigned) scanned, (int) this->current_state_,
+                       (unsigned) fill);
+              noise_pb_last = now;
+            }
+          }
+        }
+#endif
       }
     }
   }
@@ -439,8 +476,12 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
     int32_t scale = static_cast<int32_t>(vol * 32768.0f);
 #ifdef USE_VA_CLIENT_DIAGNOSTICS
     uint32_t clipped = 0;
+    uint32_t loud_in = 0;
 #endif
     for (size_t i = 0; i < pairs; i++) {
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
+      if (in[i] > kNoiseLevel || in[i] < -kNoiseLevel) loud_in++;
+#endif
       int32_t v = (static_cast<int32_t>(in[i]) * scale) >> 15;
       if (v > 32767) {
         v = 32767;
@@ -457,6 +498,21 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
     }
 #ifdef USE_VA_CLIENT_DIAGNOSTICS
     this->clipped_samples_ += clipped;
+    // If the chunk we just RECEIVED over the WS is already noise-like, the
+    // garbage came over the wire (upstream / bridge / OpenAI), not from our
+    // playback path. mic_streaming flags the cross-task-overlap case.
+    if (pairs > 0 && static_cast<float>(loud_in) / static_cast<float>(pairs) >= kNoiseRatio) {
+      static uint32_t noise_in_last = 0;
+      uint32_t now = millis();
+      if (now - noise_in_last >= 200) {
+        ESP_LOGW(TAG,
+                 "incoming noise-like chunk: %u/%u samples near full scale "
+                 "(state=%d fill=%u mic_streaming=%d)",
+                 (unsigned) loud_in, (unsigned) pairs, (int) this->current_state_,
+                 (unsigned) this->audio_fill_, (int) this->is_mic_streaming_());
+        noise_in_last = now;
+      }
+    }
 #endif
     data = reinterpret_cast<const uint8_t *>(this->play_buf_.data());
     // len is unchanged (pairs * 2 == len rounded down; trailing odd byte ignored).
