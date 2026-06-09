@@ -1832,9 +1832,15 @@ va_client:
                   media_player.is_announcing:
                     id: external_media_player
               timeout: 2s
-          # i2s_audio_speaker ring tail — same 400 ms used on the wake
-          # path. Mic stays closed until this delay completes.
-          - delay: 400ms
+          # i2s_audio_speaker ring tail + room-echo decay. The wake path
+          # gets away with 400 ms because the user speaks right after the
+          # chime and any leaked tail merges into their turn; here the user
+          # typically pauses ~1 s, so a chime tail that survives the XMOS
+          # AEC (~10× leak, see CLAUDE.md) arrives ALONE, server VAD calls
+          # it a turn, and the 900 ms silence that follows commits it —
+          # the user's real answer then lands mid-response. 800 ms lets
+          # the echo decay before the mic opens.
+          - delay: 800ms
     - lambda: 'id(va)->commit_followup_mic();'
     - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
     - script.execute: control_leds
