@@ -101,7 +101,8 @@ void VaClient::loop() {
       // something hiccupped downstream — the user hears silence or a
       // brief stuck-sample glitch. Log the first occurrence per reply so
       // we know whether bad audio in a turn correlates with this.
-      if (!this->underrun_logged_this_turn_ && !this->speaker_->has_buffered_data()) {
+      if (!this->underrun_logged_this_turn_ && this->playback_started_this_turn_ &&
+          !this->speaker_->has_buffered_data()) {
         ESP_LOGW(TAG, "downstream underrun: %u bytes queued in PSRAM but speaker chain is dry",
                  (unsigned) fill);
         this->underrun_logged_this_turn_ = true;
@@ -121,6 +122,9 @@ void VaClient::loop() {
         this->audio_head_ = (this->audio_head_ + accepted) % kAudioBufBytes;
         this->audio_fill_ -= accepted;
         portEXIT_CRITICAL(&this->ring_mux_);
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
+        this->playback_started_this_turn_ = true;
+#endif
         static uint32_t dbg_last = 0;
         uint32_t now = millis();
         if (now - dbg_last >= 500) {
@@ -181,11 +185,28 @@ void VaClient::loop() {
   // speaker never drains, we still progress so the LED doesn't lock in
   // `replying` forever.
   if (this->current_state_ == State::WaitingDrain && this->audio_fill_ == 0) {
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
+    if (this->drain_t_fill_zero_ == 0) {
+      this->drain_t_fill_zero_ = millis();
+    }
+#endif
     const bool speaker_drained =
         (this->speaker_ != nullptr) && !this->speaker_->has_buffered_data();
     const bool timed_out =
         (millis() - this->state_entered_ms_) >= kSpeakerStopTimeoutMs;
     if (speaker_drained || timed_out) {
+#ifdef USE_VA_CLIENT_DIAGNOSTICS
+      // How long has_buffered_data() stayed true AFTER the PSRAM ring emptied.
+      // The downstream chain (resampler+mixer+i2s) is bounded to ~1 s, so a
+      // clean drain should land well under kSpeakerStopTimeoutMs. If this is
+      // consistently pinned at the timeout, has_buffered_data() isn't reporting
+      // empty (mixer sources run `timeout: never`) rather than there being a
+      // genuinely long tail — that distinction decides whether to bump the
+      // timeout or fix the drained-check.
+      ESP_LOGI(TAG, "downstream tail: %u ms after PSRAM empty (%s)",
+               (unsigned) (millis() - this->drain_t_fill_zero_),
+               speaker_drained ? "reported empty" : "timeout fallback");
+#endif
       if (timed_out && !speaker_drained) {
         ESP_LOGW(TAG,
                  "speaker still had buffered data after %u ms — "
@@ -817,6 +838,8 @@ void VaClient::start_session() {
   this->ws_gap_max_ms_ = 0;
   this->clipped_samples_ = 0;
   this->underrun_logged_this_turn_ = false;
+  this->playback_started_this_turn_ = false;
+  this->drain_t_fill_zero_ = 0;
 #endif
   // Tell the bridge a turn is starting so it flips to the listening phase
   // now, rather than lagging until OpenAI's server VAD reports speech.

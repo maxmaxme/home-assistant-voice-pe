@@ -295,6 +295,15 @@ class VaClient : public Component {
   uint32_t ws_gap_max_ms_{0};
   uint32_t clipped_samples_{0};
   bool underrun_logged_this_turn_{false};
+  // True once the first play() of the turn has been accepted by the speaker.
+  // The underrun detector keys off this: before the first play() the chain is
+  // legitimately dry (the turn just started), so checking has_buffered_data()
+  // there only catches the startup transient, not a real mid-turn starvation.
+  bool playback_started_this_turn_{false};
+  // millis() when audio_fill_ first hit 0 in WaitingDrain. Lets us measure the
+  // pure downstream tail (resampler+mixer+i2s) after the PSRAM ring emptied,
+  // independent of how long the PSRAM ring itself took to drain.
+  uint32_t drain_t_fill_zero_{0};
   static constexpr uint32_t kWsGapWarnMs = 80;  // > ~3× normal 20 ms frame
 #endif
 };
