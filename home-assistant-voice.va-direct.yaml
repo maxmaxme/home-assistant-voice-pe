@@ -41,7 +41,7 @@ esphome:
   name: home-assistant-voice
   friendly_name: Home Assistant Voice
   name_add_mac_suffix: true
-  min_version: 2026.5.0
+  min_version: 2026.6.0
   on_boot:
     priority: 375
     then:
@@ -1861,6 +1861,7 @@ audio_dac:
 
 micro_wake_word:
   id: mww
+  task_stack_in_psram: true
   microphone:
     microphone: i2s_mics
     channels: 1
