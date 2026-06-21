@@ -185,15 +185,14 @@ void VaClient::loop() {
   // speaker never drains, we still progress so the LED doesn't lock in
   // `replying` forever.
   if (this->current_state_ == State::WaitingDrain && this->audio_fill_ == 0) {
-#ifdef USE_VA_CLIENT_DIAGNOSTICS
     if (this->drain_t_fill_zero_ == 0) {
       this->drain_t_fill_zero_ = millis();
     }
-#endif
     const bool speaker_drained =
         (this->speaker_ != nullptr) && !this->speaker_->has_buffered_data();
+    // Timed from PSRAM-empty, not WaitingDrain entry — see drain_t_fill_zero_.
     const bool timed_out =
-        (millis() - this->state_entered_ms_) >= kSpeakerStopTimeoutMs;
+        (millis() - this->drain_t_fill_zero_) >= kSpeakerStopTimeoutMs;
     if (speaker_drained || timed_out) {
 #ifdef USE_VA_CLIENT_DIAGNOSTICS
       // How long has_buffered_data() stayed true AFTER the PSRAM ring emptied.
@@ -812,6 +811,7 @@ void VaClient::start_session() {
   // signal from the old one.
   this->request_follow_up_for_next_turn_ = false;
   this->interrupt_pending_ = false;
+  this->drain_t_fill_zero_ = 0;
   this->cancel_timeout("va_followup");
   this->cancel_timeout("va_followup_open");
   this->cancel_timeout("va_tts_tail");
@@ -839,7 +839,6 @@ void VaClient::start_session() {
   this->clipped_samples_ = 0;
   this->underrun_logged_this_turn_ = false;
   this->playback_started_this_turn_ = false;
-  this->drain_t_fill_zero_ = 0;
 #endif
   // Tell the bridge a turn is starting so it flips to the listening phase
   // now, rather than lagging until OpenAI's server VAD reports speech.

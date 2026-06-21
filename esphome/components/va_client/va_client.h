@@ -228,6 +228,15 @@ class VaClient : public Component {
   // LED in `replying` forever.
   static constexpr uint32_t kSpeakerStopTimeoutMs = 3000;
 
+  // millis() when audio_fill_ first hit 0 in WaitingDrain, i.e. when the
+  // PSRAM ring emptied and only the downstream chain (resampler+mixer+i2s)
+  // still holds audio. kSpeakerStopTimeoutMs is measured from THIS, not from
+  // WaitingDrain entry: the server sends phase=idle while seconds of TTS may
+  // still be queued in PSRAM, so timing from entry would let the timeout
+  // expire during the legitimate PSRAM play-out and fire the fallback every
+  // long reply. 0 = not yet emptied this turn. Reset per turn in start_session.
+  uint32_t drain_t_fill_zero_{0};
+
   // Tracks the opcode of the in-flight WS message so we can route
   // continuation frames (op_code = 0) to the same handler.
   bool last_data_was_binary_{false};
@@ -300,10 +309,6 @@ class VaClient : public Component {
   // legitimately dry (the turn just started), so checking has_buffered_data()
   // there only catches the startup transient, not a real mid-turn starvation.
   bool playback_started_this_turn_{false};
-  // millis() when audio_fill_ first hit 0 in WaitingDrain. Lets us measure the
-  // pure downstream tail (resampler+mixer+i2s) after the PSRAM ring emptied,
-  // independent of how long the PSRAM ring itself took to drain.
-  uint32_t drain_t_fill_zero_{0};
   static constexpr uint32_t kWsGapWarnMs = 80;  // > ~3× normal 20 ms frame
 #endif
 };
