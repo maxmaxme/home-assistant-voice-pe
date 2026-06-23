@@ -651,10 +651,12 @@ void VaClient::apply_server_phase_(const std::string &phase) {
       this->turn_t_listening_ = millis();
     }
 #endif
-    // Server heard us — watchdog no longer needed.
+    // Server heard us — the pre-speech misfire watchdog is no longer needed,
+    // but keep a hard ceiling on the active turn in case the backend wedges.
     this->cancel_timeout("va_no_speech");
     this->cancel_timeout("va_followup");
     this->transition_(State::Listening, "listening");
+    this->arm_listening_watchdog_();
     return;
   }
 
@@ -667,9 +669,8 @@ void VaClient::apply_server_phase_(const std::string &phase) {
     // Either of these is a real turn in progress; cancel anything
     // related to draining or follow-up from a prior turn.
     this->cancel_timeout("va_followup");
-    this->cancel_timeout("va_followup_open");
-    this->cancel_timeout("va_tts_tail");
     this->cancel_timeout("va_no_speech");
+    this->cancel_timeout("va_listen_max");
     this->request_follow_up_for_next_turn_ = false;
     this->transition_(phase == "thinking" ? State::Thinking : State::Replying, phase);
     return;
@@ -678,6 +679,7 @@ void VaClient::apply_server_phase_(const std::string &phase) {
   if (phase == "idle") {
     // The interesting case. The state we're coming FROM dictates what
     // "idle" means.
+    this->cancel_timeout("va_listen_max");
     const State from = this->current_state_;
     const bool turn_just_ended = (from == State::Thinking || from == State::Replying);
 
@@ -693,7 +695,6 @@ void VaClient::apply_server_phase_(const std::string &phase) {
       // already flushed the ring), no follow-up.
       this->interrupt_pending_ = false;
       this->request_follow_up_for_next_turn_ = false;
-      this->cancel_timeout("va_tts_tail");
       this->transition_(State::Idle, "idle");
       return;
     }
@@ -790,6 +791,24 @@ void VaClient::finish_drain_() {
   this->transition_(State::Idle, "idle");
 }
 
+void VaClient::arm_listening_watchdog_() {
+  // Hard ceiling on time spent in Listening, re-armed on every entry. The
+  // per-turn timers (va_no_speech, va_followup) are cancelled the moment the
+  // server confirms speech (phase=listening); without this, a backend that
+  // then goes silent with the WS still open would leave the mic streaming and
+  // the LED stuck in `listening` indefinitely. set_timeout replaces by name,
+  // so re-arming on each Listening entry just refreshes the deadline.
+  this->set_timeout("va_listen_max", kMaxListeningMs, [this]() {
+    if (this->current_state_ != State::Listening) {
+      return;
+    }
+    ESP_LOGW(TAG, "max listening window (%u ms) elapsed — aborting turn",
+             (unsigned) kMaxListeningMs);
+    this->send_interrupt();  // tell the bridge to abort the (possibly wedged) turn
+    this->transition_(State::Idle, "idle");
+  });
+}
+
 void VaClient::start_session() {
   // Wake-word handler in yaml routes here. Open the mic so on_mic_data_
   // starts forwarding to the server. Without this gate, OpenAI Realtime's
@@ -813,8 +832,7 @@ void VaClient::start_session() {
   this->interrupt_pending_ = false;
   this->drain_t_fill_zero_ = 0;
   this->cancel_timeout("va_followup");
-  this->cancel_timeout("va_followup_open");
-  this->cancel_timeout("va_tts_tail");
+  this->cancel_timeout("va_listen_max");
   // Barge-in: a wake word fired while a previous reply was still playing.
   // The `start` we send below cancels the reply upstream, but the bytes
   // already burst into our PSRAM ring would otherwise keep draining into
@@ -862,6 +880,7 @@ void VaClient::start_session() {
 #endif
     this->transition_(State::Idle, "idle");
   });
+  this->arm_listening_watchdog_();
 }
 
 void VaClient::commit_followup_mic() {
@@ -885,6 +904,7 @@ void VaClient::commit_followup_mic() {
       this->transition_(State::Idle, "idle");
     }
   });
+  this->arm_listening_watchdog_();
 }
 
 void VaClient::send_interrupt() {
@@ -903,8 +923,7 @@ void VaClient::send_interrupt() {
   this->request_follow_up_for_next_turn_ = false;
   this->cancel_timeout("va_no_speech");
   this->cancel_timeout("va_followup");
-  this->cancel_timeout("va_followup_open");
-  this->cancel_timeout("va_tts_tail");
+  this->cancel_timeout("va_listen_max");
   // The phase=idle the server is about to send shouldn't open a follow-
   // up mic window — user said "stop", not "wait for me to keep talking".
   // apply_server_phase_("idle") consumes this on the next idle.

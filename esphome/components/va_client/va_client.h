@@ -141,6 +141,10 @@ class VaClient : public Component {
   // Called once the speaker chain has actually drained (or kSpeakerStopTimeoutMs
   // elapsed). Decides whether to open a follow-up window or go straight to Idle.
   void finish_drain_();
+  // Arm the hard ceiling on time spent in Listening. Called from every path
+  // that enters Listening so the mic can never stay open indefinitely if the
+  // backend wedges with the WS still up. See kMaxListeningMs.
+  void arm_listening_watchdog_();
 
   std::string url_;
   std::string token_;
@@ -219,6 +223,15 @@ class VaClient : public Component {
   // user pressed wake/button and stayed silent — close the session so we
   // don't sit there with the mic open eating OpenAI minutes.
   static constexpr uint32_t kNoSpeechTimeoutMs = 7000;
+  // Hard ceiling on total time the mic may stay open in Listening, armed on
+  // EVERY entry to Listening (fresh wake, server-confirmed listening, follow-up
+  // window). kNoSpeechTimeoutMs catches the common wake-but-silent misfire and
+  // is cancelled once the server confirms speech; this is the backstop for the
+  // remaining gap — a backend that goes silent after confirming `listening`
+  // while the WS stays open would otherwise leave the mic streaming and the LED
+  // stuck in `listening` forever. 30 s is well above any real single utterance
+  // to a home assistant, so it never truncates a legitimate turn.
+  static constexpr uint32_t kMaxListeningMs = 30000;
   // Hard ceiling on how long we'll wait for the speaker chain to drain
   // (resampler ring + mixer source ring, via has_buffered_data()) after
   // PSRAM hits 0 before giving up and proceeding anyway. Should be >

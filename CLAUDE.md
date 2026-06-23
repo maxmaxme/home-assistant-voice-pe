@@ -60,7 +60,13 @@ the device just streams mic audio up and plays speaker audio down.
   in voice-assistant). Each transition fires `on_phase`.
 - **Reconnect**: exponential backoff (1s / 2s / 5s / 10s, capped).
 - **No-speech watchdog**: 7 s after entering `listening` with no audio
-  flowing → tear the session down and return to `idle`.
+  flowing → tear the session down and return to `idle`. Cancelled once the
+  server confirms speech.
+- **Max-listen watchdog** (`kMaxListeningMs`, 30 s): a hard ceiling re-armed
+  on *every* entry to `listening` (wake, server-confirmed listening, follow-up).
+  Backstops the case where the backend goes silent after confirming speech with
+  the WS still open — without it the mic would stream and the LED stay in
+  `listening` indefinitely. On expiry it sends `interrupt` and returns to `idle`.
 - **Repeated-failure handling**: 5 consecutive failed connect/handshake
   attempts trip `on_repeated_failure` (used to play the error chime).
   After a 30 s stable connection the counter re-arms.

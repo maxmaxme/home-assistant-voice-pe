@@ -209,11 +209,6 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
-  # Global variable tracking if the group media player volume was recent changed.
-  - id: group_volume_changed
-    type: bool
-    restore_value: no
-    initial_value: 'false'
   # Global variable tracking if the jack has been plugged touched.
   - id: jack_plugged_recently
     type: bool
@@ -360,7 +355,7 @@ binary_sensor:
         then:
           - if:
               condition:
-                lambda: return !id(init_in_progress) && !id(color_changed) && !id(group_volume_changed);
+                lambda: return !id(init_in_progress) && !id(color_changed);
               then:
                 - if:
                     condition:
@@ -428,7 +423,7 @@ binary_sensor:
         then:
           - if:
               condition:
-                lambda: return !id(init_in_progress) && !id(color_changed) && !id(group_volume_changed);
+                lambda: return !id(init_in_progress) && !id(color_changed);
               then:
                 - script.execute:
                     id: play_sound
@@ -449,7 +444,7 @@ binary_sensor:
         then:
           - if:
               condition:
-                lambda: return !id(init_in_progress) && !id(color_changed) && !id(group_volume_changed);
+                lambda: return !id(init_in_progress) && !id(color_changed);
               then:
                 - script.execute:
                     id: play_sound
@@ -465,7 +460,7 @@ binary_sensor:
         then:
           - if:
               condition:
-                lambda: return !id(init_in_progress) && !id(color_changed) && !id(group_volume_changed);
+                lambda: return !id(init_in_progress) && !id(color_changed);
               then:
                 - script.execute:
                     id: play_sound
@@ -1361,24 +1356,6 @@ script:
           value: 0
       - script.execute: control_leds
 
-  # Script executed when the volume is increased/decreased from the dial for the group media player
-  - id: control_group_volume
-    mode: restart
-    parameters:
-      increase_volume: bool  # True: Increase volume / False: Decrease volume.
-    then:
-      - delay: 16ms
-      # TODO va-direct: no sendspin_group_media_player; group volume not supported.
-      - lambda: id(group_volume_changed) = true;
-      - script.execute: control_leds
-      - delay: 1s
-      - lambda: id(dial_touched) = false;
-      - lambda: id(group_volume_changed) = false;
-      - sensor.rotary_encoder.set_value:
-          id: dial
-          value: 0
-      - script.execute: control_leds
-
   # Script executed when the hue is increased/decreased from the dial
   - id: control_hue
     mode: restart
@@ -1504,13 +1481,6 @@ script:
     then:
       - lambda: 'id(is_timer_active) = false;  // TODO va-direct: no timer API on va_client yet'
 
-  # DEAD CODE (va-direct): in the original yaml this script enabled the
-  # stop wake word while external_media_player was announcing. We no
-  # longer route TTS through external_media_player, so the wait_until
-  # condition never fires. Stop word arming now lives in va_client's
-  # on_phase handler (enable on phase=replying, disable otherwise).
-  # Kept for diff readability with upstream; safe to delete once the
-  # va-direct yaml is the only one.
   # Watchdog for va_client follow-up windows: if the user stays silent
   # during a request_follow_up window, va_client closes the mic at
   # kRequestFollowUpMs (10 s) but doesn't notify yaml. Without this script
@@ -1534,30 +1504,6 @@ script:
             - micro_wake_word.disable_model: stop
             - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
             - script.execute: control_leds
-
-  - id: activate_stop_word_once
-    then:
-      - wait_until:
-          condition:
-            media_player.is_announcing:
-              id: external_media_player
-          timeout: 5s
-      - delay: 1s
-      # Enable stop wake word
-      - if:
-          condition:
-            switch.is_off: timer_ringing
-          then:
-            - micro_wake_word.enable_model: stop
-            - wait_until:
-                not:
-                  media_player.is_announcing:
-                    id: external_media_player
-            - if:
-                condition:
-                  switch.is_off: timer_ringing
-                then:
-                  - micro_wake_word.disable_model: stop
 
 i2s_audio:
   - id: i2s_output
@@ -1609,7 +1555,7 @@ speaker:
   # feed mixer inputs. The resampler/mixer chain handles 24k→48k upsample,
   # mono→stereo, 16→32bit expansion AND drives the i2s leaf with the right
   # startup handshake (which raw speaker.play() on the leaf was failing).
-  # va_client writes 24k mono pcm16 into announcement_resampling_speaker.
+  # va_client writes 24k mono pcm16 into media_resampling_speaker.
   - platform: mixer
     id: mixing_speaker
     output_speaker: i2s_audio_speaker
@@ -1707,9 +1653,6 @@ media_source:
   - platform: audio_http
     id: http_announcement_source
     buffer_size: 250000
-  - platform: audio_http
-    id: http_media_source
-    buffer_size: 500000
   - platform: sendspin
     id: sendspin_media_source
     fixed_delay: 480 microseconds  # The AIC3204 DAC used, as configured, on the VPE delays audio by 480 microseconds
