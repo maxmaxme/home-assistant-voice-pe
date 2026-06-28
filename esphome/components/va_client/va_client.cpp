@@ -646,29 +646,43 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
   // "phase":"idle" coming back from the server (response.done).
   if (!this->is_mic_streaming_())
     return;
-  // i2s_mics yields interleaved stereo int32 frames: [L0_low,L0_high, R0_low,R0_high, L1..].
-  // Each frame = 8 bytes (2ch × 4 bytes). We want one channel converted to
-  // int16 mono. Real audio sits in the high 16 bits (ADC pads up to int32).
-  if (samples.size() < 8)
-    return;
+  const int16_t *send_data;
+  size_t send_samples;
 
-  const auto *in32 = reinterpret_cast<const int32_t *>(samples.data());
-  size_t total_int32 = samples.size() / 4;
-  size_t mono_samples = total_int32 / 2;  // half belong to this channel
-  size_t offset = this->mic_channel_ & 0x1;
+  if (this->mic_mono16_) {
+    // Plain codec (e.g. ES8311): frames are already int16 mono PCM. The i2s
+    // tail can leave an odd trailing byte mid-frame; truncate to whole samples.
+    send_samples = samples.size() / sizeof(int16_t);
+    if (send_samples == 0)
+      return;
+    send_data = reinterpret_cast<const int16_t *>(samples.data());
+  } else {
+    // i2s_mics yields interleaved stereo int32 frames: [L0_low,L0_high, R0_low,R0_high, L1..].
+    // Each frame = 8 bytes (2ch × 4 bytes). We want one channel converted to
+    // int16 mono. Real audio sits in the high 16 bits (ADC pads up to int32).
+    if (samples.size() < 8)
+      return;
 
-  this->mono_buf_.resize(mono_samples);
-  for (size_t i = 0; i < mono_samples; i++) {
-    int32_t s = in32[i * 2 + offset];
-    this->mono_buf_[i] = static_cast<int16_t>(s >> 16);
+    const auto *in32 = reinterpret_cast<const int32_t *>(samples.data());
+    size_t total_int32 = samples.size() / 4;
+    size_t mono_samples = total_int32 / 2;  // half belong to this channel
+    size_t offset = this->mic_channel_ & 0x1;
+
+    this->mono_buf_.resize(mono_samples);
+    for (size_t i = 0; i < mono_samples; i++) {
+      int32_t s = in32[i * 2 + offset];
+      this->mono_buf_[i] = static_cast<int16_t>(s >> 16);
+    }
+    send_data = this->mono_buf_.data();
+    send_samples = this->mono_buf_.size();
   }
 
   auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
   // 10ms timeout (~portTICK_PERIOD_MS): if WS task is briefly busy we wait
   // a tick rather than dropping the frame and spamming "Could not lock"
   // errors. If we're swamped, we accept dropping rather than blocking mic.
-  esp_websocket_client_send_bin(handle, reinterpret_cast<const char *>(this->mono_buf_.data()),
-                                static_cast<int>(this->mono_buf_.size() * sizeof(int16_t)),
+  esp_websocket_client_send_bin(handle, reinterpret_cast<const char *>(send_data),
+                                static_cast<int>(send_samples * sizeof(int16_t)),
                                 10 / portTICK_PERIOD_MS);
 }
 

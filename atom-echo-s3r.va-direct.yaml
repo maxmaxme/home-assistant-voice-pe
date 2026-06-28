@@ -1,0 +1,179 @@
+substitutions:
+  name: atom-echo-s3r
+  friendly_name: Atom Echo S3R
+  # va-direct: voice-assistant WS endpoint (mDNS on LAN).
+  va_url: "ws://va.local:3001/voice"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: true
+  min_version: 2026.6.0
+  on_boot:
+    priority: 600
+    then:
+      - switch.turn_on: speaker_amp
+      - micro_wake_word.start:
+
+esp32:
+  board: esp32-s3-devkitc-1
+  cpu_frequency: 240MHz
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: DEBUG
+
+# va-direct: no `api:` — HA never talks to this device (audio goes over the
+# va_client WS, tools go via the MCP server on the backend). mDNS only
+# advertises _esphomelib under USE_API, so advertise it manually or `esphome
+# run` can't discover the device for OTA upload. (Serial is the fallback.)
+mdns:
+  services:
+    - service: _esphomelib
+      protocol: _tcp
+      port: 6053
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+
+# Minimal provisioning: connect to the AP captive portal on first boot to
+# enter WiFi creds; they then live in NVS. (No Improv on this thin client.)
+wifi:
+  ap:
+    ssid: "${friendly_name} Setup"
+captive_portal:
+
+i2c:
+  - id: bus_a
+    sda: GPIO45
+    scl: GPIO4
+    frequency: 400kHz
+
+audio_dac:
+  - platform: es8311
+    id: es8311_dac
+    address: 0x18
+    sample_rate: 16000
+    bits_per_sample: 16bit
+
+# ES8311 is a single full-duplex codec: ADC (mic) and DAC (speaker) share one
+# I2S bus and therefore one sample rate. Run the bus at 16 kHz (the mic uplink
+# rate the backend expects); va_client's 24 kHz speaker output is converted
+# down to 16 kHz by the resampler below.
+i2s_audio:
+  - id: i2s_shared
+    i2s_lrclk_pin: GPIO11
+    i2s_bclk_pin: GPIO17
+    i2s_mclk_pin: GPIO18
+
+microphone:
+  - platform: i2s_audio
+    id: echo_mic
+    i2s_din_pin: GPIO0
+    adc_type: external
+    pdm: false
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: mono
+    i2s_mode: primary
+    i2s_audio_id: i2s_shared
+
+speaker:
+  # Hardware speaker output via the ES8311 DAC + NS4150B amp.
+  - platform: i2s_audio
+    id: i2s_speaker
+    dac_type: external
+    i2s_dout_pin: GPIO48
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: mono
+    i2s_mode: primary
+    i2s_audio_id: i2s_shared
+    audio_dac: es8311_dac
+    timeout: never
+    # Live PCM from the WS jitters in chunk arrival; a larger buffer avoids
+    # starvation gaps (hiss / silence) between chunks.
+    buffer_duration: 500ms
+  # va_client writes 24 kHz mono PCM16 here; the resampler converts to the
+  # 16 kHz hardware bus rate.
+  - platform: resampler
+    id: va_speaker
+    output_speaker: i2s_speaker
+    sample_rate: 16000
+    bits_per_sample: 16
+
+switch:
+  - platform: gpio
+    id: speaker_amp
+    pin: GPIO3
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+micro_wake_word:
+  id: mww
+  task_stack_in_psram: true
+  microphone:
+    microphone: echo_mic
+    channels: 1
+    # Raw MEMS mic level is lower than XMOS-cleaned audio; boost for mww.
+    # Tune on hardware if detection is weak or false-triggers.
+    gain_factor: 4
+  stop_after_detection: false
+  vad:
+  models:
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu
+    - model: hey_jarvis
+      id: hey_jarvis
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
+      id: stop
+  on_wake_word_detected:
+    # The "stop" model is a cancel signal, not a session start. send_interrupt()
+    # is a no-op when idle, so an unconditional call is safe.
+    - if:
+        condition:
+          lambda: 'return wake_word == "Stop" || wake_word == "stop";'
+        then:
+          - lambda: 'id(va)->send_interrupt();'
+        else:
+          # Fresh turn. start_session() also barges in on a reply still
+          # playing: the bridge cancels the in-flight reply on `start`, and
+          # start_session() flushes the local audio queue as a backstop.
+          - lambda: 'id(va)->start_session();'
+
+external_components:
+  - source:
+      type: local
+      path: esphome/components
+    components: [va_client]
+
+va_client:
+  id: va
+  url: ${va_url}
+  token: !secret va_device_token
+  microphone: echo_mic
+  mic_channel: 0
+  input_format: mono16
+  speaker: va_speaker
+  on_repeated_failure:
+    - logger.log: "va_client: repeated connection failure"
+
+binary_sensor:
+  - platform: gpio
+    id: action_button
+    pin:
+      number: GPIO41
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    on_press:
+      - lambda: 'id(va)->send_interrupt();'

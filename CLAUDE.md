@@ -36,6 +36,7 @@ the device just streams mic audio up and plays speaker audio down.
 | `home-assistant-voice.va-direct.yaml` | **Active config — this is what gets flashed.** Uses the custom `va_client` component. |
 | `home-assistant-voice.yaml` | Original upstream config. Kept for reference / upstream sync. Not built. |
 | `home-assistant-voice.8mb.yaml`, `home-assistant-voice.factory.yaml` | Other upstream variants — unused here. |
+| `atom-echo-s3r.va-direct.yaml` | Thin-client config for the **M5Stack Atom Echo S3R** (ESP32-S3-PICO, ES8311 mono codec, no XMOS). Reuses `va_client` with `input_format: mono16`; single full-duplex 16 kHz I2S bus + resampler. No LED ring/timers/Improv. See `docs/superpowers/specs/2026-06-29-atom-echo-s3r-firmware-design.md`. |
 | `voice-kit.yaml` | XMOS voice-kit component. Shared between configs. |
 | `secrets.yaml` | **Gitignored.** Holds `va_url` (e.g. `ws://va.local:3001/voice`) and `va_device_token` (this device's own bearer; must be registered as a `voice` device for some user in the backend — see below). |
 
@@ -43,15 +44,17 @@ the device just streams mic audio up and plays speaker audio down.
 
 | File | Role |
 | --- | --- |
-| `__init__.py` | ESPHome codegen + YAML schema. Configurable: `url`, `token`, `microphone`, `mic_channel`, `speaker`, `on_phase` (automation), `on_repeated_failure` (automation). |
+| `__init__.py` | ESPHome codegen + YAML schema. Configurable: `url`, `token`, `microphone`, `mic_channel`, `input_format` (`stereo32` default = XMOS stereo-int32; `mono16` = plain int16-mono codec like ES8311), `speaker`, `on_phase` (automation), `on_repeated_failure` (automation). |
 | `va_client.h`, `va_client.cpp` | The actual client. Built on `esp_websocket_client` (esp-idf). |
 | `automation.h` | `OnPhaseTrigger : Trigger<std::string>` (fires on every phase transition with the new phase name) and `OnRepeatedFailureTrigger : Trigger<>` (fires when the failure counter trips). |
 
 ### What `va_client.cpp` does
 
-- **Mic stream**: pulls int32 stereo frames from the microphone,
-  drops to int16 mono via `>>16` on the selected `mic_channel`, and
-  ships PCM16 over the WS as binary frames.
+- **Mic stream**: with `input_format: stereo32` (default) pulls int32
+  stereo frames from the microphone and drops to int16 mono via `>>16`
+  on the selected `mic_channel`; with `input_format: mono16` forwards
+  already-int16-mono frames as-is. Either way ships PCM16 over the WS as
+  binary frames.
 - **Speaker playback**: incoming binary frames are PCM16 audio. A
   **2 MB PSRAM ring buffer** smooths jitter and lets us defer "ready"
   LED state until the buffer actually drains.

@@ -69,6 +69,7 @@ class VaClient : public Component {
   void set_token(const std::string &token) { token_ = token; }
   void set_microphone(microphone::Microphone *m) { mic_ = m; }
   void set_mic_channel(uint8_t c) { mic_channel_ = c; }
+  void set_mic_mono16(bool m) { mic_mono16_ = m; }
   void set_speaker(speaker::Speaker *s) { speaker_ = s; }
   // Sets the output-volume multiplier applied to TTS in handle_binary_.
   // Driven from yaml by external_media_player's volume / mute state so the
@@ -189,6 +190,7 @@ class VaClient : public Component {
   // Lifetime-stable storage referenced by esp_websocket_client_config_t.headers.
   std::string auth_header_;
   uint8_t mic_channel_{0};
+  bool mic_mono16_{false};
 
   microphone::Microphone *mic_{nullptr};
   speaker::Speaker *speaker_{nullptr};
