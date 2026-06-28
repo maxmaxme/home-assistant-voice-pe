@@ -786,6 +786,19 @@ void VaClient::finish_drain_() {
   // the post-turn decision point: emit the deferred LED-idle, then either
   // open a follow-up mic window (request_follow_up case or kFollowupMs > 0)
   // or go straight to Idle.
+
+  // A stop / barge-in that landed while the reply was still draining set
+  // interrupt_pending_, but apply_server_phase_("idle") couldn't consume it —
+  // by then we were already past phase=idle, sitting in WaitingDrain (the
+  // common case: the server reports idle when generation ends, seconds before
+  // the TTS finishes playing out). Honor it here: the user cancelled, so close
+  // to Idle and NEVER open a follow-up window.
+  if (this->interrupt_pending_) {
+    this->interrupt_pending_ = false;
+    this->request_follow_up_for_next_turn_ = false;
+    this->transition_(State::Idle, "idle");
+    return;
+  }
 #ifdef USE_VA_CLIENT_DIAGNOSTICS
   if (this->turn_t_wake_ != 0) {
     uint32_t now = millis();
