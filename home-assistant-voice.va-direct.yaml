@@ -1087,6 +1087,24 @@ event:
       - easter_egg_press
 
 script:
+  # Brief solid-red ring as feedback that a "stop" / center-button cancel
+  # actually aborted an in-flight reply (otherwise the ring just silently goes
+  # idle and the user can't tell the stop registered). The caller sets
+  # phase=idle first, then runs this: hold red 800 ms, then repaint via
+  # control_leds — which, being idle now, returns the ring to its idle state.
+  # mode: restart so a rapid second stop re-extends the flash, not stacks it.
+  - id: stop_feedback_flash
+    mode: restart
+    then:
+      - light.turn_on:
+          id: voice_assistant_leds
+          brightness: 60%
+          red: 100%
+          green: 0%
+          blue: 0%
+          effect: "none"
+      - delay: 800ms
+      - script.execute: control_leds
   # Master script controlling the LEDs, based on different conditions : initialization in progress, wifi and api connected and voice assistant phase.
   # For the sake of simplicity and re-usability, the script calls child scripts defined below.
   # This script will be called every time one of these conditions is changing.
@@ -1857,7 +1875,10 @@ micro_wake_word:
                             - speaker.stop:
                                 id: media_resampling_speaker
                             - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
-                            - script.execute: control_leds
+                            # Red-ring feedback that the stop registered, then
+                            # repaint to idle (stop_feedback_flash ends in
+                            # control_leds after 800 ms).
+                            - script.execute: stop_feedback_flash
                             - micro_wake_word.disable_model: stop
                     else:
                       # Non-stop wake word: branch on the assistant's current

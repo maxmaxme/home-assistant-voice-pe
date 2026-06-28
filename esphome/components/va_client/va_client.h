@@ -207,12 +207,20 @@ class VaClient : public Component {
   std::vector<int16_t> mono_buf_;  // mic task only
   std::vector<int16_t> play_buf_;  // websocket task only
 
-  // Follow-up dialog window after a real turn ends. 0 disables — mic
-  // closes immediately after each reply, like the original turn-based
-  // pipeline. Currently 0 because XMOS AEC is too leaky and the mic
-  // hears its own TTS tail during this window. Re-enable (e.g. 5000)
-  // when AEC is tuned or we add wait_for_user on the server.
-  static constexpr uint32_t kFollowupMs = 0;
+  // Implicit follow-up dialog window after every real turn ends: the mic
+  // reopens for this long so the user can answer back without a new wake
+  // word. 0 disables (mic closes immediately, original turn-based pipeline).
+  // The earlier hard XMOS-AEC concern (the mic hearing its own TTS tail) is
+  // mitigated by kFollowupOpenDelayMs below — we wait for the reply's i2s/DAC
+  // tail to clear before opening the mic, the same guard that makes this work
+  // cleanly on the reference firmware.
+  static constexpr uint32_t kFollowupMs = 8000;
+  // Echo guard: delay between the reply fully draining (finish_drain_, which
+  // fires ~500 ms before TRUE silence — the i2s 500 ms ring + ~100 ms DAC tail
+  // are downstream of has_buffered_data()) and opening the implicit follow-up
+  // mic. Without it the reply's own tail leaks through the imperfect XMOS AEC
+  // into the fresh mic and the server VAD commits it as a phantom turn.
+  static constexpr uint32_t kFollowupOpenDelayMs = 700;
   // Used when the server explicitly requests a follow-up via the
   // request_follow_up tool — overrides kFollowupMs for a single turn.
   // Longer than the default because the model asked a real question
@@ -284,6 +292,46 @@ class VaClient : public Component {
   // are tiny (a few field updates + ≤2 memcpys of at most a few KB
   // per WS frame), so contention is negligible.
   portMUX_TYPE ring_mux_ = portMUX_INITIALIZER_UNLOCKED;
+
+  static constexpr uint32_t kPlaybackSampleRate = 24000;  // incoming TTS PCM rate
+
+  // Playback jitter buffer ("prebuffer"). Before starting/resuming playback we
+  // hold audio in the PSRAM ring until at least this many ms have accumulated
+  // (or a short deadline elapses), so the downstream resampler/mixer/i2s chain
+  // starts with a cushion and a network jitter gap (we see 100-340 ms gaps)
+  // doesn't dry it out → audible crackle. Re-armed whenever the ring drains to
+  // empty (reply start AND post-underflow). 0 would disable it.
+  static constexpr uint32_t kPlaybackPrebufferMs = 150;
+  // True while we're accumulating the prebuffer cushion (holding playback).
+  // Touched by handle_binary_ (WS task, arms it) + loop() (main task, releases);
+  // plain flag, the tiny cross-task race is harmless.
+  bool playback_priming_{false};
+  // millis() when priming started (first byte after the ring was empty); used
+  // for the prime deadline so real-time (non-burst) audio still starts promptly.
+  uint32_t prime_started_ms_{0};
+
+  // Resampler cold-start SILENCE-PRIME (crackle fix). The resampler does NOT
+  // idle-timeout: resample(stop_gracefully=false) never returns FINISHED and
+  // its output mixer-source is timeout:never, so the chain stays WARM between
+  // normal replies. It goes COLD only after an explicit `speaker.stop:
+  // media_resampling_speaker` (yaml interrupt / "stop" / wake / follow-up),
+  // which tears the task down (is_stopped()==true). The next reply then cold-
+  // starts a fresh AudioResampler whose windowed-sinc FIR begins from a zero
+  // state → a startup-transient click. A PSRAM prebuffer can't fix it (the
+  // transient is downstream of the ring). Fix: when cold, feed kChainPrimeMs of
+  // SILENCE first so the FIR settles to a clean zero output before real audio.
+  // Cold = resampler is_stopped() (precise, true exactly post-speaker.stop) OR,
+  // as a backup, nothing fed for > kChainColdMs. Both are only ever true at a
+  // real cold reply-start, never mid-speech; a needless prime on a warm chain
+  // is harmless (60 ms silence).
+  static constexpr uint32_t kChainPrimeMs = 60;   // silence burst to warm the filter
+  static constexpr uint32_t kChainColdMs = 600;   // backup timer; is_stopped() is the primary signal
+  // Bytes of silence still to feed this cold-start (24 kHz mono 16-bit). >0
+  // while priming; loop() feeds silence and holds real-audio drain until 0.
+  size_t chain_prime_remaining_{0};
+  // millis() of the last time we fed the resampler ANYTHING (silence or real).
+  // Used to detect a cold chain: now - last_fed_ms_ > kChainColdMs. 0 = never fed.
+  uint32_t last_fed_ms_{0};
 
 #ifdef USE_VA_CLIENT_DIAGNOSTICS
   // Diagnostics are opt-in. Enable via `diagnostics: true` in the yaml

@@ -95,6 +95,52 @@ void VaClient::loop() {
     size_t fill = this->audio_fill_;
     portEXIT_CRITICAL(&this->ring_mux_);
     if (fill > 0) {
+      // Resampler cold-start SILENCE-PRIME (crackle fix). When the chain is
+      // cold (post speaker.stop, or nothing fed for > kChainColdMs, or never
+      // fed) feed kChainPrimeMs of silence BEFORE the first real sample so the
+      // resampler's windowed-sinc FIR settles to a clean zero output and the
+      // reply doesn't open with a startup click. Real audio waits safely in
+      // PSRAM (and builds a small cushion) until priming completes. See the
+      // header note for why neither signal can mis-fire mid-speech.
+      {
+        const uint32_t now_ms = millis();
+        const bool resampler_cold = this->speaker_->is_stopped() ||
+                                    this->last_fed_ms_ == 0 ||
+                                    (now_ms - this->last_fed_ms_) > kChainColdMs;
+        if (this->chain_prime_remaining_ == 0 && resampler_cold) {
+          this->chain_prime_remaining_ =
+              (size_t) kChainPrimeMs * (kPlaybackSampleRate / 1000) * 2;  // ms→bytes (mono 16-bit)
+          ESP_LOGD(TAG, "resampler cold — priming %u bytes of silence before reply",
+                   (unsigned) this->chain_prime_remaining_);
+        }
+        if (this->chain_prime_remaining_ > 0) {
+          static const uint8_t kSilence[480] = {0};  // 10ms @24k mono16; fed in chunks
+          size_t want = std::min(this->chain_prime_remaining_, sizeof(kSilence));
+          size_t fed = this->speaker_->play(kSilence, want);
+          if (fed > 0) {
+            this->chain_prime_remaining_ -= fed;
+            this->last_fed_ms_ = now_ms;  // count silence as "fed" so the cold-check clears
+          }
+          // Hold real-audio drain until the chain is warmed; re-enter loop()
+          // next tick to continue/finish priming.
+          return;
+        }
+      }
+      // Jitter buffer priming gate. After the ring was empty (reply start or a
+      // post-underflow gap) hold playback until either the prebuffer cushion
+      // has accumulated (fill >= target) or a deadline elapses (so real-time,
+      // non-burst audio still starts promptly). The cushion lets the downstream
+      // chain ride out a network gap without drying out → no crackle.
+      if (this->playback_priming_) {
+        const size_t target =
+            (size_t) kPlaybackPrebufferMs * (kPlaybackSampleRate / 1000) * 2;
+        if (fill >= target || (millis() - this->prime_started_ms_) >= kPlaybackPrebufferMs) {
+          this->playback_priming_ = false;
+          ESP_LOGD(TAG, "prebuffer ready (%u bytes) — playback start", (unsigned) fill);
+        } else {
+          return;  // keep accumulating; don't drain (and don't false-flag underrun)
+        }
+      }
 #ifdef USE_VA_CLIENT_DIAGNOSTICS
       // Detector 3: downstream underrun. If the resampler/mixer/i2s chain
       // ran out of bytes to play while we *still* have PSRAM queued,
@@ -118,6 +164,7 @@ void VaClient::loop() {
       // across it would block the writer and cause audio underrun.
       size_t accepted = this->speaker_->play(this->audio_buf_ + head, contiguous);
       if (accepted > 0) {
+        this->last_fed_ms_ = millis();  // keep the chain "warm" for cold-detection
         portENTER_CRITICAL(&this->ring_mux_);
         this->audio_head_ = (this->audio_head_ + accepted) % kAudioBufBytes;
         this->audio_fill_ -= accepted;
@@ -546,6 +593,7 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   // to guarantee that ordering — len is at most a few KB per WS frame
   // and PSRAM memcpy is ~10–20 µs, well under any audio deadline.
   portENTER_CRITICAL(&this->ring_mux_);
+  const bool was_empty = (this->audio_fill_ == 0);
   size_t tail = this->audio_tail_;
   size_t first = std::min(len, kAudioBufBytes - tail);
   std::memcpy(this->audio_buf_ + tail, data, first);
@@ -555,6 +603,16 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   this->audio_tail_ = (tail + len) % kAudioBufBytes;
   this->audio_fill_ += len;
   portEXIT_CRITICAL(&this->ring_mux_);
+  // Jitter buffer: arm priming only when the ring was empty AND the downstream
+  // chain is dry — a true reply start or a real underflow. Mid-reply the ring
+  // routinely flips empty (loop() drains each WS clump on arrival) while the
+  // downstream chain still holds ~600 ms of audio; re-arming there would just
+  // spam "prebuffer ready" and could hold a trailing chunk for the full
+  // deadline. has_buffered_data() is a counter read, safe enough from the WS task.
+  if (was_empty && !this->playback_priming_ && !this->speaker_->has_buffered_data()) {
+    this->prime_started_ms_ = millis();
+    this->playback_priming_ = true;
+  }
   // No per-chunk log — fires 50+ times per reply at DEBUG and drowns the
   // log. The throttled drain log in loop() gives enough visibility into
   // queue depth.
@@ -655,6 +713,7 @@ void VaClient::apply_server_phase_(const std::string &phase) {
     // but keep a hard ceiling on the active turn in case the backend wedges.
     this->cancel_timeout("va_no_speech");
     this->cancel_timeout("va_followup");
+    this->cancel_timeout("va_followup_open");
     this->transition_(State::Listening, "listening");
     this->arm_listening_watchdog_();
     return;
@@ -669,6 +728,7 @@ void VaClient::apply_server_phase_(const std::string &phase) {
     // Either of these is a real turn in progress; cancel anything
     // related to draining or follow-up from a prior turn.
     this->cancel_timeout("va_followup");
+    this->cancel_timeout("va_followup_open");
     this->cancel_timeout("va_no_speech");
     this->cancel_timeout("va_listen_max");
     this->request_follow_up_for_next_turn_ = false;
@@ -772,17 +832,30 @@ void VaClient::finish_drain_() {
   }
 
   if (kFollowupMs > 0) {
-    // Implicit follow-up window after every reply (XMOS AEC permitting).
-    // Currently kFollowupMs is 0 so this branch never runs — kept so a
-    // future re-enable is one constant flip rather than a state-machine
-    // rewrite.
-    this->transition_(State::FollowupArmed, "listening");
-    ESP_LOGI(TAG, "implicit follow-up window open (%u ms)", (unsigned) kFollowupMs);
-    this->set_timeout("va_followup", kFollowupMs, [this]() {
-      if (this->current_state_ == State::FollowupArmed) {
-        ESP_LOGI(TAG, "follow-up window expired");
-        this->transition_(State::Idle, "idle");
+    // Implicit follow-up window after every reply: reopen the mic so the user
+    // can continue without a wake word. Unlike the request_follow_up path,
+    // this is silent — no chime — like the reference firmware. Park in Idle
+    // (mic off, LED idle) for kFollowupOpenDelayMs first so the reply's i2s/
+    // DAC tail (finish_drain_ fires ~500 ms before true silence) clears the
+    // speaker before the mic opens; otherwise the imperfect XMOS AEC lets the
+    // tail leak in and the server VAD commits it as a phantom turn.
+    this->transition_(State::Idle, "idle");
+    ESP_LOGI(TAG, "implicit follow-up: mic opens in %u ms", (unsigned) kFollowupOpenDelayMs);
+    this->set_timeout("va_followup_open", kFollowupOpenDelayMs, [this]() {
+      // Only open from a clean Idle. A wake word, Stop, or new turn during the
+      // guard moves us out of Idle (and cancels this timer in start_session /
+      // send_interrupt), so this is belt-and-suspenders.
+      if (this->current_state_ != State::Idle) {
+        return;
       }
+      ESP_LOGI(TAG, "implicit follow-up window open (%u ms)", (unsigned) kFollowupMs);
+      this->transition_(State::FollowupArmed, "listening");
+      this->set_timeout("va_followup", kFollowupMs, [this]() {
+        if (this->current_state_ == State::FollowupArmed) {
+          ESP_LOGI(TAG, "follow-up window expired");
+          this->transition_(State::Idle, "idle");
+        }
+      });
     });
     return;
   }
@@ -832,6 +905,7 @@ void VaClient::start_session() {
   this->interrupt_pending_ = false;
   this->drain_t_fill_zero_ = 0;
   this->cancel_timeout("va_followup");
+  this->cancel_timeout("va_followup_open");
   this->cancel_timeout("va_listen_max");
   // Barge-in: a wake word fired while a previous reply was still playing.
   // The `start` we send below cancels the reply upstream, but the bytes
@@ -923,6 +997,7 @@ void VaClient::send_interrupt() {
   this->request_follow_up_for_next_turn_ = false;
   this->cancel_timeout("va_no_speech");
   this->cancel_timeout("va_followup");
+  this->cancel_timeout("va_followup_open");
   this->cancel_timeout("va_listen_max");
   // The phase=idle the server is about to send shouldn't open a follow-
   // up mic window — user said "stop", not "wait for me to keep talking".
