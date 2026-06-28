@@ -1087,11 +1087,12 @@ event:
       - easter_egg_press
 
 script:
-  # Brief solid-red ring as feedback that a "stop" / center-button cancel
-  # actually aborted an in-flight reply (otherwise the ring just silently goes
-  # idle and the user can't tell the stop registered). The caller sets
-  # phase=idle first, then runs this: hold red 800 ms, then repaint via
-  # control_leds — which, being idle now, returns the ring to its idle state.
+  # Brief solid-red ring as feedback that the "stop" wake word actually aborted
+  # an in-flight reply (otherwise the ring just silently goes idle and the user
+  # can't tell the stop registered). Invoked only from the stop-word handler;
+  # the center-button cancel path repaints straight to idle without this flash.
+  # The caller sets phase=idle first, then runs this: hold red 800 ms, then
+  # repaint via control_leds — which, being idle now, returns the ring to idle.
   # mode: restart so a rapid second stop re-extends the flash, not stacks it.
   - id: stop_feedback_flash
     mode: restart

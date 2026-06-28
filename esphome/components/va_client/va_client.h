@@ -152,6 +152,15 @@ class VaClient : public Component {
   // that enters Listening so the mic can never stay open indefinitely if the
   // backend wedges with the WS still up. See kMaxListeningMs.
   void arm_listening_watchdog_();
+  // Cancel both follow-up timers (the open-delay guard and the open window).
+  // Every turn boundary — new session, interrupt, server phase change, barge-in
+  // — needs both gone, so they're cancelled together here rather than in pairs
+  // scattered across the call sites.
+  void cancel_followup_timers_();
+  // Clear the per-turn modifier flags so a stale signal from the previous turn
+  // (a deferred request_follow_up, an interrupt, a drain timestamp) can't bleed
+  // into the next one. Shared by start_session() and prepare_barge_in().
+  void reset_turn_modifiers_();
 
   std::string url_;
   std::string token_;
@@ -309,6 +318,10 @@ class VaClient : public Component {
   // doesn't dry it out → audible crackle. Re-armed whenever the ring drains to
   // empty (reply start AND post-underflow). 0 would disable it.
   static constexpr uint32_t kPlaybackPrebufferMs = 150;
+  // ms→bytes at the incoming PCM rate (mono 16-bit), folded at compile time so
+  // the loop() priming gate doesn't redo the multiply every tick.
+  static constexpr size_t kPlaybackPrebufferBytes =
+      (size_t) kPlaybackPrebufferMs * (kPlaybackSampleRate / 1000) * 2;
   // True while we're accumulating the prebuffer cushion (holding playback).
   // Touched by handle_binary_ (WS task, arms it) + loop() (main task, releases);
   // plain flag, the tiny cross-task race is harmless.
@@ -333,6 +346,10 @@ class VaClient : public Component {
   // is harmless (60 ms silence).
   static constexpr uint32_t kChainPrimeMs = 60;   // silence burst to warm the filter
   static constexpr uint32_t kChainColdMs = 600;   // backup timer; is_stopped() is the primary signal
+  // The prime burst in bytes (mono 16-bit @ kPlaybackSampleRate), folded at
+  // compile time.
+  static constexpr size_t kChainPrimeBytes =
+      (size_t) kChainPrimeMs * (kPlaybackSampleRate / 1000) * 2;
   // Bytes of silence still to feed this cold-start (24 kHz mono 16-bit). >0
   // while priming; loop() feeds silence and holds real-audio drain until 0.
   size_t chain_prime_remaining_{0};
