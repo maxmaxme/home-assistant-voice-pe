@@ -19,7 +19,7 @@ Voice PE (this firmware)
   │   wake word (micro_wake_word) runs locally on the ESP32
   │   XMOS DSP does AEC / NS / IC / AGC (configured via voice_kit over I2C)
   │
-  └── WebSocket /voice (bearer VA_DEVICE_TOKEN)
+  └── WebSocket /voice (bearer = this device's token)
         ──▶ voice-assistant container :3001
               ──▶ OpenAI Realtime API (gpt-realtime-2)
               ──▶ HA MCP server (tools only, no voice pipeline)
@@ -37,7 +37,7 @@ the device just streams mic audio up and plays speaker audio down.
 | `home-assistant-voice.yaml` | Original upstream config. Kept for reference / upstream sync. Not built. |
 | `home-assistant-voice.8mb.yaml`, `home-assistant-voice.factory.yaml` | Other upstream variants — unused here. |
 | `voice-kit.yaml` | XMOS voice-kit component. Shared between configs. |
-| `secrets.yaml` | **Gitignored.** Holds `va_url` (e.g. `ws://va.local:3001/voice`) and `va_device_token` (must match the backend's `VA_DEVICE_TOKEN`). |
+| `secrets.yaml` | **Gitignored.** Holds `va_url` (e.g. `ws://va.local:3001/voice`) and `va_device_token` (this device's own bearer; must be registered as a `voice` device for some user in the backend — see below). |
 
 ## Custom component: `esphome/components/va_client/`
 
@@ -116,12 +116,18 @@ or a sidecar HA integration.
 `secrets.yaml` is gitignored. Required keys:
 
 - `va_url` — backend WebSocket URL, e.g. `ws://va.local:3001/voice`.
-- `va_device_token` — bearer token; must equal `VA_DEVICE_TOKEN` in
-  the voice-assistant container's env on the Pi.
+- `va_device_token` — this device's own bearer token. The backend
+  authenticates it **per device against the DB**, not a shared env value:
+  on the WS handshake it hashes the presented token and looks up a `voice`
+  identity. So the token must be **registered as a voice device** for some
+  user — via the web panel's Users page (add a voice device) or
+  `npm run users -- attach-voice --user <id> --token <this-token>`. There is
+  no longer a `VA_DEVICE_TOKEN` env on the backend; each speaker can carry its
+  own distinct token.
 - All upstream secrets (WiFi creds, etc.) stay as in stock.
 
-If the token mismatches, the device gets `401` on the WS upgrade and
-the failure counter trips after a few retries.
+If the token isn't a registered voice device, the backend rejects the WS
+upgrade with `4401` and the failure counter trips after a few retries.
 
 ## Critical caveat: XMOS AEC isn't perfect
 
