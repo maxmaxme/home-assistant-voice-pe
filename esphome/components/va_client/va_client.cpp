@@ -1030,6 +1030,22 @@ void VaClient::send_start_() {
   ESP_LOGD(TAG, "send_start_ — WS msg sent");
 }
 
+void VaClient::prepare_barge_in() {
+  // Barge-in: wake word fired during a reply. The yaml already flushed the
+  // PSRAM ring + stopped the resampler; here we neutralise the state machine
+  // so the imminent chime wait can't let loop() drive finish_drain_ → open a
+  // stray implicit follow-up window. cancel the follow-up timers, drop any
+  // pending modifiers, and pin to Idle (mic off — is_mic_streaming_() is false
+  // for Idle, so the chime tail isn't streamed). start_session() runs after the
+  // chime + echo-guard delay and transitions us cleanly to Listening.
+  this->cancel_timeout("va_followup");
+  this->cancel_timeout("va_followup_open");
+  this->request_follow_up_for_next_turn_ = false;
+  this->interrupt_pending_ = false;
+  this->drain_t_fill_zero_ = 0;
+  this->current_state_ = State::Idle;
+}
+
 void VaClient::flush_audio_queue() {
   // The ring reset has to happen under the mux: handle_binary_ runs on the
   // WS task and could be mid-write — seeing head=tail=fill=0 partway through

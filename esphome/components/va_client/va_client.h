@@ -80,6 +80,13 @@ class VaClient : public Component {
   // start_session() runs, and folded into start_session()/send_interrupt()
   // as a backstop. Safe to call when the ring is already empty (no-op).
   void flush_audio_queue();
+  // Called from yaml at the very start of a barge-in (wake word during a reply),
+  // right after flush_audio_queue() and before the wake chime. The cancelled
+  // reply may still be in WaitingDrain; this pins the state machine to Idle and
+  // kills the follow-up timers so loop()'s drain check can't fire finish_drain_
+  // — and open a stray follow-up window — during the chime, before
+  // start_session() reopens the mic. Mic stays closed (Idle) through the chime.
+  void prepare_barge_in();
   // Called from yaml's on_followup_opened automation AFTER the chime has
   // finished announcing through the speaker (wait_until !is_announcing +
   // i2s tail). Opens the mic for kRequestFollowUpMs. No-op if the device

@@ -1903,6 +1903,10 @@ micro_wake_word:
                             # We no longer send a separate interrupt here —
                             # interrupt now means "abort to idle", not "barge".
                             - lambda: 'id(va)->flush_audio_queue();'
+                            # Neutralise the draining old turn so the chime wait
+                            # below can't let finish_drain_ open a stray follow-up
+                            # window before start_session() reopens the mic.
+                            - lambda: 'id(va)->prepare_barge_in();'
                             - speaker.stop:
                                 id: media_resampling_speaker
                             # Play the same wake chime as fresh-session so the
