@@ -1,3 +1,25 @@
+/*
+ * va_client — declarations for the direct-streaming WebSocket client component.
+ *
+ * New in this fork of Home Assistant Voice: Preview Edition
+ * (esphome/home-assistant-voice-pe): replaces the stock ESPHome
+ * `voice_assistant` component with a thin client that streams PCM16 audio
+ * directly to a voice-assistant backend over a WebSocket. Added 2026.
+ *
+ * Copyright (C) 2026 maxmaxme.
+ *
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details. You should have received a copy of the GNU General Public
+ * License along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
 #pragma once
 
 #include "esphome/core/automation.h"
