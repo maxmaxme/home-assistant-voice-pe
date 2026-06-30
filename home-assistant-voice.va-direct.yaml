@@ -32,7 +32,7 @@ substitutions:
   factory_reset_confirmed_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/factory_reset_confirmed.mp3
   easter_egg_tick_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tick.mp3
   easter_egg_tada_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tada.mp3
-  error_cloud_expired_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_disconnected.flac
+  error_cloud_expired_sound_file: sounds/error_cloud_expired_30.mp3
   # va-direct: voice-assistant WS endpoint on the Pi (mDNS resolves on LAN).
   va_url: "ws://va.local:3001/voice"
   # va_device_token must be defined in secrets.yaml (do NOT inline)
