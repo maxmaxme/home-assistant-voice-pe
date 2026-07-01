@@ -267,14 +267,10 @@ switch:
       - script.execute: control_leds
     on_turn_off:
       - script.execute: control_leds
-  # Wake Word Sound Switch.
-  - platform: template
-    id: wake_sound
-    name: Wake sound
-    icon: "mdi:bullhorn"
-    entity_category: config
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
+  # Wake-word beep is server-driven now: gated by id(va)->wake_sound_enabled(),
+  # set from the voice-assistant `hello` (realtime.wakeChime). The old local
+  # `wake_sound` template switch was dead weight here — this firmware has no
+  # HA api / web_server, so nothing could ever toggle it.
   # Internal switch to track when a timer is ringing on the device.
   - platform: template
     id: timer_ringing
@@ -1782,7 +1778,7 @@ va_client:
     # chime tail from leaking through the XMOS AEC into the server VAD.
     - if:
         condition:
-          switch.is_on: wake_sound
+          lambda: 'return id(va)->wake_sound_enabled();'
         then:
           - script.execute:
               id: play_sound
@@ -1915,10 +1911,10 @@ micro_wake_word:
                             # reopened — without it the device just silences
                             # mid-reply and the user can't tell whether they
                             # need to repeat themselves. Skipped when the
-                            # wake_sound switch is off.
+                            # server disabled the wake sound (realtime.wakeChime).
                             - if:
                                 condition:
-                                  switch.is_on: wake_sound
+                                  lambda: 'return id(va)->wake_sound_enabled();'
                                 then:
                                   - script.execute:
                                       id: play_sound
@@ -1972,7 +1968,7 @@ micro_wake_word:
                                       id: media_resampling_speaker
                                   - if:
                                       condition:
-                                        switch.is_on: wake_sound
+                                        lambda: 'return id(va)->wake_sound_enabled();'
                                       then:
                                         - script.execute:
                                             id: play_sound

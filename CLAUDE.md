@@ -78,10 +78,12 @@ the device just streams mic audio up and plays speaker audio down.
 
 JSON messages (text frames) interleaved with binary PCM16:
 
-- **server → device**: `hello` (handshake ack), `phase` (state transition),
-  `error`, `pong`, `follow_up` (`{ms, chime?}` sent right before the
-  end-of-turn `idle` after a spoken reply; `chime:true` = play the "your turn"
-  chime — see the follow-up section).
+- **server → device**: `hello` (handshake ack; `{audioOut, wakeChime}` — the
+  wake-word beep is gated by `wakeChime`, since this firmware has no HA api /
+  web server to toggle it locally), `phase` (state transition), `error`,
+  `pong`, `follow_up` (`{ms, chime?}` sent right before the end-of-turn `idle`
+  after a spoken reply; `chime:true` = play the "your turn" chime — see the
+  follow-up section).
 - **device → server**: `start` (begin a turn — also barges in: the bridge
   cancels any reply still in flight on `start`), `interrupt` (abort the
   current turn back to idle — Stop wake word, center-button cancel, or the

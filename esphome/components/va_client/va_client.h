@@ -117,6 +117,11 @@ class VaClient : public Component {
   // before the chime finished — the new session takes priority).
   void commit_followup_mic();
 
+  // Whether the local wake-word beep should play. Set from the server `hello`
+  // (the device has no HA/web control surface for it). Defaults on until the
+  // first hello arrives. Read from the yaml wake handler.
+  bool wake_sound_enabled() const { return this->wake_sound_enabled_; }
+
   // Called from the static esp-idf event handler trampoline.
   void on_ws_event(int32_t event_id, void *event_data);
 
@@ -201,6 +206,9 @@ class VaClient : public Component {
   std::string auth_header_;
   uint8_t mic_channel_{0};
   bool mic_mono16_{false};
+  // Local wake-word beep preference, pushed by the server `hello`. On until the
+  // first hello lands (matches stock default).
+  bool wake_sound_enabled_{true};
 
   microphone::Microphone *mic_{nullptr};
   speaker::Speaker *speaker_{nullptr};

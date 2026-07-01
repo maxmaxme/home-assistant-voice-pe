@@ -505,7 +505,15 @@ void VaClient::handle_text_(const char *data, size_t len) {
     return;
   }
 
-  // hello / pong / anything we don't model yet — silently ignore.
+  if (std::strcmp(type, "hello") == 0) {
+    // Handshake ack. Carries the admin's wake-beep preference (the device has
+    // no HA/web control surface for it). Default on if the field is absent.
+    this->wake_sound_enabled_ = doc["wakeChime"] | true;
+    ESP_LOGI(TAG, "hello: wake_sound=%s", this->wake_sound_enabled_ ? "on" : "off");
+    return;
+  }
+
+  // pong / anything we don't model yet — silently ignore.
   ESP_LOGD(TAG, "WS text ignored: type=%s", type);
 }
 
