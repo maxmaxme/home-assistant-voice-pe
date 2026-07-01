@@ -54,8 +54,8 @@ class OnRepeatedFailureTrigger : public Trigger<> {
   explicit OnRepeatedFailureTrigger(VaClient *parent);
 };
 
-// Fires when the device opens a follow-up mic window (i.e. server's
-// request_follow_up message landed and the audio buffer has drained).
+// Fires when the device opens a CHIMED follow-up mic window (i.e. a
+// server `follow_up {chime:true}` landed and the audio buffer has drained).
 // yaml uses this to play the wake chime + flip the LED to "listening"
 // so the user knows the assistant is waiting for their answer.
 class OnFollowupOpenedTrigger : public Trigger<> {
@@ -112,9 +112,9 @@ class VaClient : public Component {
   void prepare_barge_in();
   // Called from yaml's on_followup_opened automation AFTER the chime has
   // finished announcing through the speaker (wait_until !is_announcing +
-  // i2s tail). Opens the mic for kRequestFollowUpMs. No-op if the device
-  // is no longer armed (e.g. user already pressed wake before the chime
-  // finished — the new session takes priority).
+  // i2s tail). Opens the mic for the server-sent window (server_follow_up_ms_).
+  // No-op if the device is no longer armed (e.g. user already pressed wake
+  // before the chime finished — the new session takes priority).
   void commit_followup_mic();
 
   // Called from the static esp-idf event handler trampoline.
@@ -135,9 +135,10 @@ class VaClient : public Component {
     WaitingDrain,   // server said idle; we're waiting for the ring +
                     //   speaker chain to actually play out before
                     //   emitting LED-idle and (maybe) opening followup
-    FollowupArmed,  // request_follow_up handoff: yaml is playing the
-                    //   chime; commit_followup_mic() will transition
-                    //   us back to Listening when the chime ends
+    FollowupArmed,  // a follow-up window is opening: either the silent
+                    //   ambient window (mic reopens after kFollowupOpenDelayMs)
+                    //   or the chimed handoff (yaml plays the chime, then
+                    //   commit_followup_mic() flips us back to Listening)
   };
 
   void connect_();
@@ -159,7 +160,9 @@ class VaClient : public Component {
   // Apply the server's reported phase ("listening" | "thinking" | "replying"
   // | "idle") to the state machine. Mostly a wrapper around transition_
   // with the policy choices (when to defer LED-idle, when to open follow-
-  // up, etc.) collected in one place.
+  // up, etc.) collected in one place. The implicit follow-up window is latched
+  // separately from the `follow_up` message (see server_follow_up_ms_), not
+  // carried on the phase.
   void apply_server_phase_(const std::string &phase);
   // Returns true if the mic should be forwarding frames to the server.
   // Single derivation from current_state_ — no separate streaming flag.
@@ -180,8 +183,15 @@ class VaClient : public Component {
   // — needs both gone, so they're cancelled together here rather than in pairs
   // scattered across the call sites.
   void cancel_followup_timers_();
+  // Clear the latched follow-up window (both fields) — a new turn, a barge-in,
+  // or an interrupt supersedes any pending follow_up. One place so a future
+  // latch field doesn't have to be zeroed at every call site.
+  void clear_follow_up_latch_() {
+    this->server_follow_up_ms_ = 0;
+    this->server_follow_up_chime_ = false;
+  }
   // Clear the per-turn modifier flags so a stale signal from the previous turn
-  // (a deferred request_follow_up, an interrupt, a drain timestamp) can't bleed
+  // (a latched follow_up window, an interrupt, a drain timestamp) can't bleed
   // into the next one. Shared by start_session() and prepare_barge_in().
   void reset_turn_modifiers_();
 
@@ -208,15 +218,22 @@ class VaClient : public Component {
   State current_state_{State::Idle};
   uint32_t state_entered_ms_{0};
 
-  // Set during Replying when the server sends {"type":"request_follow_up"}.
-  // Consumed on Replying → WaitingDrain → FollowupArmed to use the longer
-  // mic window (kRequestFollowUpMs) and fire on_followup_opened so yaml
-  // plays the question chime.
-  bool request_follow_up_for_next_turn_{false};
   // Set by send_interrupt(). Consumed on the next server phase=idle so
   // it routes WaitingDrain → Idle (no chime, no mic) instead of opening
   // a follow-up window the user explicitly cancelled.
   bool interrupt_pending_{false};
+  // Follow-up window the server asked for, latched from the `follow_up` message
+  // (sent right before the end-of-turn idle after a spoken reply). Consumed in
+  // finish_drain_() once the reply finishes playing out.
+  //   server_follow_up_ms_    — window length; 0 = no follow-up (silent
+  //                             wait_for_user, barge-in, or admin disabled it —
+  //                             no `follow_up` sent). Clamped to kMaxFollowupMs.
+  //   server_follow_up_chime_ — true → chimed path (model asked a question):
+  //                             fire on_followup_opened so yaml plays the chime,
+  //                             then commit_followup_mic() opens the mic. false
+  //                             → silent ambient window opened directly.
+  uint32_t server_follow_up_ms_{0};
+  bool server_follow_up_chime_{false};
 
   std::string current_phase_{"idle"};
   std::vector<OnPhaseTrigger *> phase_triggers_;
@@ -247,25 +264,26 @@ class VaClient : public Component {
   std::vector<int16_t> mono_buf_;  // mic task only
   std::vector<int16_t> play_buf_;  // websocket task only
 
-  // Implicit follow-up dialog window after every real turn ends: the mic
-  // reopens for this long so the user can answer back without a new wake
-  // word. 0 disables (mic closes immediately, original turn-based pipeline).
+  // Implicit follow-up dialog window after a spoken reply: the mic reopens so
+  // the user can answer back without a new wake word. The DURATION is now
+  // server-driven — the bridge sends a `follow_up {ms}` message before the
+  // end-of-turn idle (see server_follow_up_ms_) and the admin sets it in the
+  // web panel. The
+  // firmware only clamps it: kMaxFollowupMs caps a bad/hostile config so the
+  // mic can't be held open indefinitely (the max-listen watchdog only guards
+  // wake/server-confirmed listening, not this window). 0 from the server means
+  // no follow-up (silent wait_for_user, barge-in, or admin disabled it).
   // The earlier hard XMOS-AEC concern (the mic hearing its own TTS tail) is
   // mitigated by kFollowupOpenDelayMs below — we wait for the reply's i2s/DAC
   // tail to clear before opening the mic, the same guard that makes this work
   // cleanly on the reference firmware.
-  static constexpr uint32_t kFollowupMs = 8000;
+  static constexpr uint32_t kMaxFollowupMs = 30000;
   // Echo guard: delay between the reply fully draining (finish_drain_, which
   // fires ~500 ms before TRUE silence — the i2s 500 ms ring + ~100 ms DAC tail
   // are downstream of has_buffered_data()) and opening the implicit follow-up
   // mic. Without it the reply's own tail leaks through the imperfect XMOS AEC
   // into the fresh mic and the server VAD commits it as a phantom turn.
   static constexpr uint32_t kFollowupOpenDelayMs = 700;
-  // Used when the server explicitly requests a follow-up via the
-  // request_follow_up tool — overrides kFollowupMs for a single turn.
-  // Longer than the default because the model asked a real question
-  // and the user might pause before answering.
-  static constexpr uint32_t kRequestFollowUpMs = 10000;
   // After start_session() we wait this long for the server to emit
   // phase=listening (i.e. server VAD heard speech). If nothing comes, the
   // user pressed wake/button and stayed silent — close the session so we

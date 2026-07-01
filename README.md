@@ -67,9 +67,12 @@ trips `on_repeated_failure` after repeated handshake failures. The deep dive —
 phase semantics, watchdogs, the AEC/follow-up caveat — is in
 [CLAUDE.md](CLAUDE.md).
 
-> **Follow-up turns are disabled** (`kFollowupMs = 0`) until echo cancellation is
-> good enough — XMOS AEC still leaks ~10× speaker→mic, so say the wake word for
-> each turn. See CLAUDE.md.
+> **Follow-up turns are server-driven.** After a spoken reply the bridge sends a
+> `follow_up {ms, chime?}` event (before the end-of-turn idle) telling the device
+> to reopen the mic so you can continue without a wake word; a silent
+> `wait_for_user` or a barge-in does not. Window length and whether a question
+> plays a chime are both set in the voice-assistant web panel (defaults: 8 s, 0
+> disables; chime off). See CLAUDE.md.
 
 ## 🚀 Build & flash
 

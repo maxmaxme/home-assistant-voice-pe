@@ -79,7 +79,9 @@ the device just streams mic audio up and plays speaker audio down.
 JSON messages (text frames) interleaved with binary PCM16:
 
 - **server → device**: `hello` (handshake ack), `phase` (state transition),
-  `error`, `pong`.
+  `error`, `pong`, `follow_up` (`{ms, chime?}` sent right before the
+  end-of-turn `idle` after a spoken reply; `chime:true` = play the "your turn"
+  chime — see the follow-up section).
 - **device → server**: `start` (begin a turn — also barges in: the bridge
   cancels any reply still in flight on `start`), `interrupt` (abort the
   current turn back to idle — Stop wake word, center-button cancel, or the
@@ -135,18 +137,37 @@ upgrade with `4401` and the failure counter trips after a few retries.
 ## Critical caveat: XMOS AEC isn't perfect
 
 Measured on M3.2 hardware: ~10× speaker → mic leak survives AEC.
-That makes barge-in / follow-up-turn detection unreliable.
+That makes barge-in / follow-up-turn detection imperfect; the
+`kFollowupOpenDelayMs` guard (park in Idle until the reply's i2s/DAC
+tail clears before opening the mic) is what keeps the follow-up window
+from committing the reply's own echo as a phantom turn.
 
-For that reason **the follow-up dialog window is currently disabled**
-in `va_client.h`:
+## Follow-up dialog window (server-driven)
 
-```cpp
-static constexpr uint32_t kFollowupMs = 0;
-```
+After a **spoken** reply the device can reopen the mic so the user
+continues without a wake word. **The server owns this decision**, not
+the firmware: the bridge sends a `follow_up {ms, chime?}` message right
+before the end-of-turn `phase=idle`, and only after a real reply. So a
+silent `wait_for_user`, a barge-in interrupt, a tool-only response, and
+the initial idle send no `follow_up` and never reopen the mic. The knobs
+live in the voice-assistant **web panel** (Realtime page):
+`realtime.followUpMs` (ambient window, default 8000, 0 disables),
+`realtime.requestFollowUpMs` (explicit-question window, default 10000, 0
+disables) and `realtime.followUpChime` (default off).
 
-Practical consequence: the user must say the wake word for each new
-turn. Once AEC improves (or we switch to a different DSP), bump
-`kFollowupMs` to reopen the mic automatically after `replying` ends.
+Two flavours, selected by the `chime` flag (the firmware only ever reads
+the `ms` the server sends — it doesn't know which knob it came from):
+
+- `chime:false` (ambient) — the after-every-reply window. Opens silently.
+- `chime:true` — the model explicitly asked a question (its
+  `request_follow_up` tool); fires independently of the ambient window and
+  (if the admin left the chime on) yaml plays the chime via
+  `on_followup_opened`, then `commit_followup_mic()` opens the mic.
+
+Firmware side: the `follow_up` handler latches `ms`/`chime` into
+`server_follow_up_ms_` (clamped to `kMaxFollowupMs`) / `server_follow_up_chime_`;
+the subsequent idle routes through WaitingDrain → `finish_drain_`, which
+consumes them once the reply has played out.
 
 ## Building / flashing
 
@@ -177,5 +198,5 @@ upstream or fixing something that genuinely needs a fork-side change.
 
 When the wire protocol changes (in lockstep with voice-assistant's
 `src/realtime/protocol.ts`), when phase semantics shift, when the
-`kFollowupMs` workaround is removed, or when a TODO comes off the
+follow-up window behaviour changes, or when a TODO comes off the
 list — update this file in the same change.

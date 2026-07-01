@@ -242,7 +242,7 @@ void VaClient::loop() {
   //
   // Note: this does *not* cover the i2s 500ms ring + ~100ms DAC tail
   // downstream of the mixer. We fire ~500ms before true silence. For
-  // the LED that's imperceptible; for the request_follow_up chime,
+  // the LED that's imperceptible; for the chimed follow-up,
   // yaml's wait_until !is_announcing + i2s tail delay already absorbs
   // any small overlap with the fading TTS tail.
   //
@@ -434,10 +434,10 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
 void VaClient::handle_text_(const char *data, size_t len) {
   ESP_LOGD(TAG, "WS text: %.*s", (int) len, data);
 
-  // ArduinoJson 7. The control channel sends tiny JSON objects — 128 bytes
-  // of stack-backed JsonDocument is plenty for the largest message we send
-  // today ({"type":"phase","value":"listening"} ≈ 38 bytes) with headroom
-  // for future fields. If a message ever overflows, deserializeJson() returns
+  // ArduinoJson 7. The control channel sends tiny JSON objects — the elastic
+  // JsonDocument grows as needed and the largest message we receive today
+  // ({"type":"follow_up","ms":8000,"chime":true} ≈ 43 bytes) is trivial. If a
+  // message ever overflows, deserializeJson() returns
   // NoMemory and we fall through to the "unknown" branch below, which logs
   // and ignores — strictly safer than the previous substring scan which
   // could match across keys.
@@ -470,17 +470,22 @@ void VaClient::handle_text_(const char *data, size_t len) {
     return;
   }
 
-  if (std::strcmp(type, "request_follow_up") == 0) {
-    // Server's model called the request_follow_up tool — it asked a
-    // question and wants the user to answer without saying a wake word.
-    // Latch the modifier; the upcoming phase=idle will route us through
-    // WaitingDrain → finish_drain_() which fires on_followup_opened
-    // after the speaker chain empties. Only meaningful while a turn is
-    // actually in flight; outside of that the next idle isn't a turn-
-    // end signal anyway and the flag is harmless.
-    ESP_LOGI(TAG, "request_follow_up received (state=%d, fill=%u bytes)",
-             (int) this->current_state_, (unsigned) this->audio_fill_);
-    this->request_follow_up_for_next_turn_ = true;
+  if (std::strcmp(type, "follow_up") == 0) {
+    // Server tells us to reopen the mic after this (spoken) turn's reply drains,
+    // so the user can continue without a wake word. Sent right before phase=idle
+    // (a silent wait_for_user / barge-in sends none). We latch the duration and
+    // whether to chime; the upcoming idle routes us through WaitingDrain →
+    // finish_drain_(), which opens the window once the speaker chain empties:
+    //   chime=false → open silently (ambient after-every-reply window);
+    //   chime=true  → fire on_followup_opened so yaml plays the "your turn"
+    //                 chime (the model explicitly asked a question).
+    // Clamp so a bad server config can't pin the mic open indefinitely.
+    uint32_t ms = doc["ms"] | 0u;
+    this->server_follow_up_ms_ = std::min(ms, kMaxFollowupMs);
+    this->server_follow_up_chime_ = doc["chime"] | false;
+    ESP_LOGI(TAG, "follow_up received: window=%u ms chime=%s (state=%d)",
+             (unsigned) this->server_follow_up_ms_,
+             this->server_follow_up_chime_ ? "yes" : "no", (int) this->current_state_);
     return;
   }
 
@@ -761,7 +766,7 @@ void VaClient::apply_server_phase_(const std::string &phase) {
     this->cancel_followup_timers_();
     this->cancel_timeout("va_no_speech");
     this->cancel_timeout("va_listen_max");
-    this->request_follow_up_for_next_turn_ = false;
+    this->clear_follow_up_latch_();
     this->transition_(phase == "thinking" ? State::Thinking : State::Replying, phase);
     return;
   }
@@ -784,7 +789,7 @@ void VaClient::apply_server_phase_(const std::string &phase) {
       // User barge-cancelled. Clean close, no drain wait (send_interrupt
       // already flushed the ring), no follow-up.
       this->interrupt_pending_ = false;
-      this->request_follow_up_for_next_turn_ = false;
+      this->clear_follow_up_latch_();
       this->transition_(State::Idle, "idle");
       return;
     }
@@ -814,8 +819,8 @@ void VaClient::finish_drain_() {
   // Called from loop() once the PSRAM ring AND the downstream speaker
   // chain have both drained (or kSpeakerStopTimeoutMs elapsed). This is
   // the post-turn decision point: emit the deferred LED-idle, then either
-  // open a follow-up mic window (request_follow_up case or kFollowupMs > 0)
-  // or go straight to Idle.
+  // open a follow-up mic window (server_follow_up_ms_ > 0 — chimed or silent
+  // per server_follow_up_chime_) or go straight to Idle.
 
   // A stop / barge-in that landed while the reply was still draining set
   // interrupt_pending_, but apply_server_phase_("idle") couldn't consume it —
@@ -825,7 +830,7 @@ void VaClient::finish_drain_() {
   // to Idle and NEVER open a follow-up window.
   if (this->interrupt_pending_) {
     this->interrupt_pending_ = false;
-    this->request_follow_up_for_next_turn_ = false;
+    this->clear_follow_up_latch_();
     this->transition_(State::Idle, "idle");
     return;
   }
@@ -859,41 +864,47 @@ void VaClient::finish_drain_() {
   }
 #endif
 
-  if (this->request_follow_up_for_next_turn_) {
-    // Server explicitly asked us to keep the mic open for an answer.
-    // yaml plays the chime via on_followup_opened, then calls
-    // commit_followup_mic() once the chime + i2s tail is fully out.
-    this->request_follow_up_for_next_turn_ = false;
-    this->transition_(State::FollowupArmed, "idle");
-    ESP_LOGI(TAG, "follow-up requested — firing on_followup_opened");
-    this->defer([this]() {
-      for (auto *t : this->followup_opened_triggers_) {
-        t->trigger();
-      }
-    });
-    return;
-  }
+  if (this->server_follow_up_ms_ > 0) {
+    // Server asked us to reopen the mic after this spoken reply (a silent
+    // wait_for_user or a barge-in sends no follow_up, so we only get here when
+    // the assistant actually spoke). Two flavours, selected by the chime flag.
+    if (this->server_follow_up_chime_) {
+      // Chimed: the model explicitly asked a question. yaml plays the chime via
+      // on_followup_opened, then calls commit_followup_mic() once the chime +
+      // i2s tail is fully out — which opens the mic for server_follow_up_ms_.
+      // Leave server_follow_up_ms_ set; commit_followup_mic() consumes it.
+      this->server_follow_up_chime_ = false;
+      this->transition_(State::FollowupArmed, "idle");
+      ESP_LOGI(TAG, "chimed follow-up — firing on_followup_opened (window %u ms)",
+               (unsigned) this->server_follow_up_ms_);
+      this->defer([this]() {
+        for (auto *t : this->followup_opened_triggers_) {
+          t->trigger();
+        }
+      });
+      return;
+    }
 
-  if (kFollowupMs > 0) {
-    // Implicit follow-up window after every reply: reopen the mic so the user
-    // can continue without a wake word. Unlike the request_follow_up path,
-    // this is silent — no chime — like the reference firmware. Park in Idle
-    // (mic off, LED idle) for kFollowupOpenDelayMs first so the reply's i2s/
-    // DAC tail (finish_drain_ fires ~500 ms before true silence) clears the
-    // speaker before the mic opens; otherwise the imperfect XMOS AEC lets the
-    // tail leak in and the server VAD commits it as a phantom turn.
+    // Silent (ambient) follow-up window: reopen the mic so the user can continue
+    // without a wake word, no chime — like the reference firmware. Park in Idle
+    // (mic off, LED idle) for kFollowupOpenDelayMs first so the reply's i2s/DAC
+    // tail (finish_drain_ fires ~500 ms before true silence) clears the speaker
+    // before the mic opens; otherwise the imperfect XMOS AEC lets the tail leak
+    // in and the server VAD commits it as a phantom turn.
+    const uint32_t window_ms = this->server_follow_up_ms_;
+    this->server_follow_up_ms_ = 0;
     this->transition_(State::Idle, "idle");
     ESP_LOGI(TAG, "implicit follow-up: mic opens in %u ms", (unsigned) kFollowupOpenDelayMs);
-    this->set_timeout("va_followup_open", kFollowupOpenDelayMs, [this]() {
+    this->set_timeout("va_followup_open", kFollowupOpenDelayMs, [this, window_ms]() {
       // Only open from a clean Idle. A wake word, Stop, or new turn during the
       // guard moves us out of Idle (and cancels this timer in start_session /
       // send_interrupt), so this is belt-and-suspenders.
       if (this->current_state_ != State::Idle) {
         return;
       }
-      ESP_LOGI(TAG, "implicit follow-up window open (%u ms)", (unsigned) kFollowupMs);
+      ESP_LOGI(TAG, "implicit follow-up window open (%u ms)", (unsigned) window_ms);
       this->transition_(State::FollowupArmed, "listening");
-      this->set_timeout("va_followup", kFollowupMs, [this]() {
+      this->set_timeout("va_followup", window_ms, [this]() {
         if (this->current_state_ == State::FollowupArmed) {
           ESP_LOGI(TAG, "follow-up window expired");
           this->transition_(State::Idle, "idle");
@@ -931,8 +942,8 @@ void VaClient::cancel_followup_timers_() {
 }
 
 void VaClient::reset_turn_modifiers_() {
-  this->request_follow_up_for_next_turn_ = false;
   this->interrupt_pending_ = false;
+  this->clear_follow_up_latch_();
   this->drain_t_fill_zero_ = 0;
 }
 
@@ -1020,10 +1031,15 @@ void VaClient::commit_followup_mic() {
              (int) this->current_state_);
     return;
   }
-  ESP_LOGI(TAG, "follow-up mic armed by yaml (window %u ms)",
-           (unsigned) kRequestFollowUpMs);
+  // The chimed-path duration the server sent (latched in server_follow_up_ms_,
+  // kept through the chime). Fall back to kMaxFollowupMs if it was somehow
+  // cleared so we never open an unbounded window.
+  const uint32_t window_ms =
+      this->server_follow_up_ms_ > 0 ? this->server_follow_up_ms_ : kMaxFollowupMs;
+  this->server_follow_up_ms_ = 0;
+  ESP_LOGI(TAG, "follow-up mic armed by yaml (window %u ms)", (unsigned) window_ms);
   this->transition_(State::Listening, "listening");
-  this->set_timeout("va_followup", kRequestFollowUpMs, [this]() {
+  this->set_timeout("va_followup", window_ms, [this]() {
     if (this->current_state_ == State::Listening) {
       ESP_LOGI(TAG, "follow-up window expired");
       this->transition_(State::Idle, "idle");
@@ -1045,7 +1061,7 @@ void VaClient::send_interrupt() {
   // we have yet to hand off is dropped. The yaml side stops the resampler
   // explicitly.
   this->flush_audio_queue();
-  this->request_follow_up_for_next_turn_ = false;
+  this->clear_follow_up_latch_();
   this->cancel_timeout("va_no_speech");
   this->cancel_followup_timers_();
   this->cancel_timeout("va_listen_max");
