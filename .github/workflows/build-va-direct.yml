@@ -1,0 +1,61 @@
+# Compiles the FORK's own configs — the ones actually flashed to devices.
+# The upstream build.yml only builds the stock factory/8mb variants, so
+# without this job a change breaking va_client or the va-direct yamls
+# sails through CI green and is only discovered at flash time.
+name: Build va-direct
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: va-direct-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    name: 🧪 va_core host tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⤵️ Check out configuration from GitHub
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - name: 🚀 Run host tests
+        run: ./tests/host/run.sh
+
+  compile:
+    name: 🔨 esphome compile ${{ matrix.file }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        file:
+          - home-assistant-voice.va-direct.yaml
+          - atom-echo-s3r.va-direct.yaml
+    steps:
+      - name: ⤵️ Check out configuration from GitHub
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@e797f83a48d564d505e1c8f39bbd42a6ebffeb59  # v6.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 📦 Cache PlatformIO + esphome build deps
+        uses: actions/cache@9255dbc9a12ea11cbd7b8e1b6aee5b8c4c0a6b32  # v4.3.1
+        with:
+          path: |
+            ~/.platformio
+            ~/.espressif
+          key: pio-${{ runner.os }}-${{ matrix.file }}-${{ hashFiles('home-assistant-voice.va-direct.yaml', 'atom-echo-s3r.va-direct.yaml') }}
+          restore-keys: |
+            pio-${{ runner.os }}-${{ matrix.file }}-
+      - name: 🔧 Install esphome
+        run: pip install esphome==2026.6.0
+      - name: 🔑 Stub secrets
+        # va_device_token is the only !secret the va-direct configs reference;
+        # any value compiles — real tokens never enter CI.
+        run: |
+          echo 'va_device_token: "ci-build-stub"' > secrets.yaml
+      - name: 🔨 Compile
+        run: esphome compile ${{ matrix.file }}

@@ -2,7 +2,7 @@ name: YAML lint
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     paths:
       - "**.yaml"
       - "**.yml"
