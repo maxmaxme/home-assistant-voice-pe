@@ -50,7 +50,7 @@ jobs:
           restore-keys: |
             pio-${{ runner.os }}-${{ matrix.file }}-
       - name: 🔧 Install esphome
-        run: pip install esphome==2026.6.0
+        run: pip install esphome==2026.6.4
       - name: 🔑 Stub secrets
         # va_device_token is the only !secret the va-direct configs reference;
         # any value compiles — real tokens never enter CI.

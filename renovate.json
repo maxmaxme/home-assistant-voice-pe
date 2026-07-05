@@ -1,0 +1,30 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard", ":timezone(Europe/Madrid)"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Keep the pinned ESPHome version in lockstep across the CI compile pin, the upstream build workflow input, and every firmware config's min_version",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/build-va-direct\\.yml$/",
+        "/^\\.github/workflows/build\\.yml$/",
+        "/\\.yaml$/"
+      ],
+      "matchStrings": [
+        "esphome==(?<currentValue>\\d+\\.\\d+\\.\\d+)",
+        "esphome-version:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)",
+        "min_version:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "datasourceTemplate": "pypi",
+      "depNameTemplate": "esphome"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "One grouped PR for every ESPHome pin so CI/build/min_version never drift apart",
+      "matchDatasources": ["pypi"],
+      "matchDepNames": ["esphome"],
+      "groupName": "esphome"
+    }
+  ]
+}
