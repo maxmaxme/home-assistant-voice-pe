@@ -44,6 +44,11 @@ ota:
   - platform: esphome
     id: ota_esphome
 
+# Not implicit since esphome 2024.6: without this a boot-looping build bricks
+# the device until someone opens the case for serial — with it, repeated boot
+# failures fall back to a minimal WiFi+OTA image that can be re-flashed OTA.
+safe_mode:
+
 # Minimal provisioning: connect to the AP captive portal on first boot to
 # enter WiFi creds; they then live in NVS. (No Improv on this thin client.)
 wifi:
@@ -82,7 +87,9 @@ microphone:
     pdm: false
     sample_rate: 16000
     bits_per_sample: 16bit
-    channel: mono
+    # esphome 2026.6+ rejects `mono` on I2S ("does not support mono") — the
+    # ES8311 ADC sits on the left slot; va_client reads it via mic_channel: 0.
+    channel: left
     i2s_mode: primary
     i2s_audio_id: i2s_shared
 
@@ -117,12 +124,33 @@ switch:
     restore_mode: ALWAYS_OFF
     internal: true
 
+globals:
+  # Last phase reported by va_client's on_phase. Lets yaml tell a follow-up
+  # window opening (listening arriving out of idle without a local
+  # start_session) apart from a normal turn — this device has no LED phase
+  # global to consult like the Voice PE config.
+  - id: va_phase
+    type: std::string
+    restore_value: no
+    initial_value: '"idle"'
+  # True while a follow-up window (ambient or chimed) is behind the current
+  # `listening` phase. Consulted by on_phase to keep the `stop` wake word
+  # armed during follow-up listening; cleared on any non-listening phase and
+  # before every locally-started session.
+  - id: followup_listening
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
 micro_wake_word:
   id: mww
   task_stack_in_psram: true
   microphone:
     microphone: echo_mic
-    channels: 1
+    # Channel INDEX into the mic stream (not a count): the left-slot mono
+    # signal is channel 0. Must match the mic's `channel: left` above or
+    # esphome 2026.6+ fails config with a channels mismatch.
+    channels: 0
     # Raw MEMS mic level is lower than XMOS-cleaned audio; boost for mww.
     # Tune on hardware if detection is weak or false-triggers.
     gain_factor: 4
@@ -142,12 +170,20 @@ micro_wake_word:
         condition:
           lambda: 'return wake_word == "Stop" || wake_word == "stop";'
         then:
-          - lambda: 'id(va)->send_interrupt();'
+          - lambda: |-
+              id(followup_listening) = false;
+              id(va)->send_interrupt();
         else:
           # Fresh turn. start_session() also barges in on a reply still
           # playing: the bridge cancels the in-flight reply on `start`, and
           # start_session() flushes the local audio queue as a backstop.
-          - lambda: 'id(va)->start_session();'
+          # Clear the follow-up flag (a wake word inside an open follow-up
+          # window lands here) and pre-mark va_phase so the deferred
+          # `listening` emit isn't mistaken for an ambient window opening.
+          - lambda: |-
+              id(followup_listening) = false;
+              id(va_phase) = "waiting";
+              id(va)->start_session();
 
 external_components:
   - source:
@@ -163,6 +199,49 @@ va_client:
   mic_channel: 0
   input_format: mono16
   speaker: va_speaker
+  on_phase:
+    # Stop-model choreography (mirrors the Voice PE config): arm `stop` while
+    # the assistant is speaking OR while a follow-up window is behind the
+    # current listening phase; disarm otherwise so a false "stop" can't kill
+    # the user's own utterance mid-turn. The follow-up case must be decided
+    # here: phase emits are deferred to the next loop pass, so this automation
+    # runs AFTER on_followup_opened and would undo anything armed there.
+    - lambda: |-
+        // `listening` arriving while we still think we're idle = the silent
+        // ambient follow-up window opening (va_core emits it with no yaml
+        // hook); local sessions pre-set va_phase to "waiting" first, and the
+        // chimed path sets the flag in on_followup_opened.
+        if (phase == "listening" && id(va_phase) == "idle") {
+          id(followup_listening) = true;
+        } else if (phase != "listening") {
+          id(followup_listening) = false;
+        }
+        id(va_phase) = phase;
+    - if:
+        condition:
+          lambda: 'return phase == "replying" || (phase == "listening" && id(followup_listening));'
+        then:
+          - micro_wake_word.enable_model: stop
+        else:
+          - micro_wake_word.disable_model: stop
+  on_followup_opened:
+    # Server-driven chimed follow-up (realtime.followUpChime). Without this
+    # handler the core would park in FollowupArmed forever waiting for
+    # commit_followup_mic(). No chime hardware ceremony on this device — just
+    # wait out the reply's DAC/room-echo tail (same 700 ms as va_core's
+    # kFollowupOpenDelayMs guard on the ambient path), then open the mic.
+    - delay: 700ms
+    # Skip if something pre-empted the window during the delay (wake word /
+    # stop moved us off idle — commit_followup_mic() would no-op and the flag
+    # would go stale). Set the flag BEFORE commit: its phase emit is deferred,
+    # so on_phase runs after this script and arms `stop` from the flag.
+    - if:
+        condition:
+          lambda: 'return id(va_phase) == "idle";'
+        then:
+          - lambda: |-
+              id(followup_listening) = true;
+              id(va)->commit_followup_mic();
   on_repeated_failure:
     - logger.log: "va_client: repeated connection failure"
 
@@ -176,4 +255,6 @@ binary_sensor:
         input: true
         pullup: true
     on_press:
-      - lambda: 'id(va)->send_interrupt();'
+      - lambda: |-
+          id(followup_listening) = false;
+          id(va)->send_interrupt();
