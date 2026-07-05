@@ -37,12 +37,12 @@ jobs:
       - name: ⤵️ Check out configuration from GitHub
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
       - name: 🐍 Set up Python
-        uses: actions/setup-python@e797f83a48d564d505e1c8f39bbd42a6ebffeb59  # v6.1.0
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
       - name: 📦 Cache PlatformIO + esphome build deps
-        uses: actions/cache@9255dbc9a12ea11cbd7b8e1b6aee5b8c4c0a6b32  # v4.3.1
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809  # v4.2.4
         with:
           path: |
             ~/.platformio
