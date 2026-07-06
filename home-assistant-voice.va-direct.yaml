@@ -1403,10 +1403,19 @@ speaker:
         timeout: never
       - id: media_mixing_input
         timeout: never
+      # va-direct: media_mixing_input is taken by va_client (the assistant's
+      # voice), so HA media playback (media library etc.) gets its own input.
+      - id: ha_media_mixing_input
+        timeout: never
 
   - platform: resampler
     id: announcement_resampling_speaker
     output_speaker: announcement_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+  - platform: resampler
+    id: ha_media_resampling_speaker
+    output_speaker: ha_media_mixing_input
     sample_rate: 48000
     bits_per_sample: 16
   - platform: resampler
@@ -1419,6 +1428,17 @@ media_player:
   - platform: speaker_source
     id: external_media_player
     name: Media Player
+    # va-direct: declared media pipeline so HA transcodes plain play_media
+    # (media library) to FLAC. Without it HA ships the raw file and playback
+    # only works for formats that happen to be compiled in (raw MP3 decoded
+    # only because the mp3 chime file drags the codec in).
+    media_pipeline:
+      format: FLAC
+      num_channels: 2
+      sample_rate: 48000
+      speaker: ha_media_resampling_speaker
+      sources:
+        - http_media_source
     announcement_pipeline:
       format: FLAC
       num_channels: 1
@@ -1486,6 +1506,9 @@ media_source:
     id: audio_file_announcement_source
   - platform: audio_http
     id: http_announcement_source
+    buffer_size: 250000
+  - platform: audio_http
+    id: http_media_source
     buffer_size: 250000
   - platform: sendspin
     id: sendspin_media_source

@@ -38,10 +38,11 @@ Voice PE this also exposes Mute, LED Ring, Wake word sensitivity, Restart;
 on the Atom Echo the mixer + announcement/media chains were added for this
 (its shared-mutex I2S bus needs mww stop/start choreography around playback
 — see `on_announcement` / `on_play` / `on_idle` in its media_player; no
-wake word while media plays). The Atom also declares a media_pipeline so HA
-transcodes plain play_media (media library) to FLAC — only the FLAC decoder
-is compiled there, unlike the VPE where the mp3 chime file drags in the MP3
-codec and raw MP3 URLs happen to decode natively.
+wake word while media plays). Both configs declare a media_pipeline too, so
+HA transcodes plain play_media (media library) to FLAC instead of shipping
+the raw file. On the VPE the HA media path has its own mixer input
+(`ha_media_mixing_input`) — `media_mixing_input` belongs to va_client (the
+assistant's voice). Nothing ducks media during a voice turn.
 `reboot_timeout: 0s` in both — the voice path must survive HA being down,
 so the device never reboots on a missing API client.
 
