@@ -10,10 +10,18 @@ esphome:
   name_add_mac_suffix: true
   min_version: 2026.6.0
   on_boot:
-    priority: 600
+    priority: 375
     then:
       - switch.turn_on: speaker_amp
-      - micro_wake_word.start:
+      # va_client's TTS volume defaults to 1.0 (full scale); on this small
+      # DAC+NS4150B+speaker that clips into audible distortion. There's no
+      # media_player here to drive volume (unlike Voice PE), so pin a lower
+      # fixed level. Tune: raise if too quiet, lower if still harsh/clipping.
+      - lambda: id(va).set_volume(0.12);
+      # micro_wake_word is started from on_phase (phase == "idle") below, not
+      # here: it finishes setup AFTER on_boot fires, so an on_boot start would
+      # no-op with "hasn't been setup yet". The first idle phase (emitted early,
+      # even before the WS connects) starts it — no boot delay needed.
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -29,6 +37,23 @@ psram:
 
 logger:
   level: DEBUG
+
+# va-direct: NTP wall clock for udp_log timestamps (same as the Voice PE
+# config). Without it JSON log lines go out without `time` and Dozzle
+# stamps by packet arrival — coarse but functional.
+time:
+  - platform: sntp
+    id: sntp_time
+
+# va-direct: forward device logs to the shared UDP sink on the Pi
+# (voice-pe-logs in home-infra/docker-compose.yml) so they land in Dozzle
+# alongside the Voice PE. Both speakers share this one sink; the `device`
+# field udp_log emits (App.get_name(), MAC-suffixed) keeps them apart.
+udp_log:
+  host: va.local
+  port: 5140
+  level: DEBUG
+  time_id: sntp_time
 
 # va-direct: no `api:` — HA never talks to this device (audio goes over the
 # va_client WS, tools go via the MCP server on the backend). mDNS only
@@ -56,10 +81,13 @@ wifi:
     ssid: "${friendly_name} Setup"
 captive_portal:
 
+# Pinout corrected against the device's printed silkscreen (the design-doc
+# map was written blind from M5 docs and had SDA/SCL, MCLK/LRCK and the amp
+# pin wrong). SCL is GPIO0 (a strapping pin, fine as I2C after boot).
 i2c:
   - id: bus_a
     sda: GPIO45
-    scl: GPIO4
+    scl: GPIO0
     frequency: 400kHz
 
 audio_dac:
@@ -68,6 +96,18 @@ audio_dac:
     address: 0x18
     sample_rate: 16000
     bits_per_sample: 16bit
+    # Analog PGA gain (default 42DB max). Feeds both the STT uplink and the
+    # wake-word path — more gain = easier wake/VAD detection. (The reply-audio
+    # distortion we chased earlier was the SPEAKER volume, not this.) 36DB is a
+    # solid middle; lower toward 24DB if the uplink audio distorts, raise to
+    # 42DB if wake detection stays weak.
+    mic_gain: 36DB
+    # Do NOT set use_microphone: true here. In the esphome es8311 component
+    # that flag sets reg14 BIT(6) = "enable PDM digital microphone", routing
+    # the ADC to the codec's PDM input. This board has an ANALOG MEMS mic, so
+    # PDM mode captures silence. The analog ADC path (reg14 analog-mic + PGA,
+    # ADC modulator, SDPOUT) is enabled unconditionally in setup(), so the
+    # mic works with the default use_microphone: false.
 
 # ES8311 is a single full-duplex codec: ADC (mic) and DAC (speaker) share one
 # I2S bus and therefore one sample rate. Run the bus at 16 kHz (the mic uplink
@@ -75,14 +115,14 @@ audio_dac:
 # down to 16 kHz by the resampler below.
 i2s_audio:
   - id: i2s_shared
-    i2s_lrclk_pin: GPIO11
+    i2s_lrclk_pin: GPIO3
     i2s_bclk_pin: GPIO17
-    i2s_mclk_pin: GPIO18
+    i2s_mclk_pin: GPIO11
 
 microphone:
   - platform: i2s_audio
     id: echo_mic
-    i2s_din_pin: GPIO0
+    i2s_din_pin: GPIO4
     adc_type: external
     pdm: false
     sample_rate: 16000
@@ -101,13 +141,20 @@ speaker:
     i2s_dout_pin: GPIO48
     sample_rate: 16000
     bits_per_sample: 16bit
-    channel: mono
+    # `left`, not `mono`: mono uses a single-slot I2S frame, but the ES8311
+    # DAC expects a stereo Philips frame (data in the left slot). A mono frame
+    # is read at the wrong slot boundaries → level-independent distortion.
+    # Matches the known-working Atom Echo S3R config.
+    channel: left
     i2s_mode: primary
     i2s_audio_id: i2s_shared
     audio_dac: es8311_dac
-    timeout: never
-    # Live PCM from the WS jitters in chunk arrival; a larger buffer avoids
-    # starvation gaps (hiss / silence) between chunks.
+    # NO `timeout: never`: the i2s_audio bus is a mutex shared with the mic
+    # (i2s_audio.h try_lock), and `never` makes the speaker hold it forever —
+    # starving micro_wake_word (mic try_lock fails → endless "Driver failed to
+    # start"). A finite timeout releases the bus in idle so the mic can listen
+    # for the wake word; the speaker re-acquires it for each reply.
+    # The 500 ms buffer still smooths WS-chunk jitter (hiss between chunks).
     buffer_duration: 500ms
   # va_client writes 24 kHz mono PCM16 here; the resampler converts to the
   # 16 kHz hardware bus rate.
@@ -120,7 +167,7 @@ speaker:
 switch:
   - platform: gpio
     id: speaker_amp
-    pin: GPIO3
+    pin: GPIO18
     restore_mode: ALWAYS_OFF
     internal: true
 
@@ -141,6 +188,73 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  # True while any rtttl tone (wake beep or a cue) is playing. on_phase's
+  # idle→mww.start is skipped while set, so the phase machine doesn't grab the
+  # mic bus mid-tone; the tone's own on_finished_playback restarts mww.
+  - id: tone_playing
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # True only for the wake/start beep: tells on_finished_playback to open the
+  # session mic after the tone. Cue tones leave it false (tone → back to idle).
+  - id: pending_start_session
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Like pending_start_session, but for the follow-up "your turn" chime: after
+  # the tone, commit the follow-up mic instead of a fresh session.
+  - id: pending_followup
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# Wake-word beep. Plays through the raw i2s_speaker (not the resampler/va_client
+# path) with its own low gain — va_client's TTS volume does NOT apply here.
+# Fired from on_wake_word_detected after mww is stopped to free the mutex bus.
+# Keep the gain low: the NS4150B amp is loud (see the va_client volume saga).
+rtttl:
+  id: wake_beep
+  speaker: i2s_speaker
+  gain: 70%
+  # The mic can't take the mutex bus while the speaker still holds it after the
+  # beep (its 500 ms idle timeout), which was swallowing the user's first
+  # utterance. So open the session mic HERE, when the beep truly ends: force
+  # the speaker to release the bus, then start the session. Length-independent,
+  # no guessed delay.
+  on_finished_playback:
+    - speaker.stop: i2s_speaker
+    # rtttl calls i2s_speaker->set_volume(gain) (rtttl.cpp:108) and never
+    # restores it, so the beep's gain sticks and quietly attenuates every
+    # subsequent TTS reply on this shared speaker. Restore full speaker volume;
+    # the reply level is controlled by va_client's own set_volume.
+    - lambda: id(i2s_speaker)->set_volume(1.0f);
+    - delay: 150ms
+    # va_client does NOT start the mic itself (it only registers a data
+    # callback, va_client.cpp:86) — it relies on micro_wake_word keeping
+    # echo_mic capturing. We stopped mww for the beep, so restart it here or
+    # the listening mic streams silence and the server never hears the user.
+    # (mww is stopped again at `thinking` for the reply's bus handoff.)
+    - micro_wake_word.start
+    # Tone finished: clear the guard, and open the session mic only if this was
+    # a wake/start beep. Cue tones leave pending_start_session false → they just
+    # return to idle wake-word listening.
+    - lambda: id(tone_playing) = false;
+    - if:
+        condition:
+          lambda: 'return id(pending_start_session);'
+        then:
+          - lambda: |-
+              id(pending_start_session) = false;
+              id(va)->start_session();
+    - if:
+        condition:
+          lambda: 'return id(pending_followup);'
+        then:
+          # Arm the flag right before commit so on_phase (deferred) reads it.
+          - lambda: |-
+              id(pending_followup) = false;
+              id(followup_listening) = true;
+              id(va)->commit_followup_mic();
 
 micro_wake_word:
   id: mww
@@ -151,11 +265,15 @@ micro_wake_word:
     # signal is channel 0. Must match the mic's `channel: left` above or
     # esphome 2026.6+ fails config with a channels mismatch.
     channels: 0
-    # Raw MEMS mic level is lower than XMOS-cleaned audio; boost for mww.
-    # Tune on hardware if detection is weak or false-triggers.
-    gain_factor: 4
+    # Digital boost for the wake-word path only (does NOT affect the STT
+    # uplink). ×2 on top of the 36DB analog PGA helps mww/VAD confirm speech;
+    # raise toward 4 if wake detection is weak, drop to 1 if it false-triggers.
+    gain_factor: 2
   stop_after_detection: false
-  vad:
+  # No `vad:` gate: on this mic the VAD model consistently fails to confirm
+  # real speech (wake model fires on "okay nabu" but VAD blocks it → multi-
+  # second detection lag). The wake model does NOT false-fire in silence here,
+  # so dropping the VAD requirement is safe and makes detection near-instant.
   models:
     - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
       id: okay_nabu
@@ -173,23 +291,20 @@ micro_wake_word:
           - lambda: |-
               id(followup_listening) = false;
               id(va)->send_interrupt();
+          - script.execute:
+              id: play_cue
+              song: "cancel:d=16,o=5,b=200:g,e"
         else:
-          # Fresh turn. start_session() also barges in on a reply still
-          # playing: the bridge cancels the in-flight reply on `start`, and
-          # start_session() flushes the local audio queue as a backstop.
-          # Clear the follow-up flag (a wake word inside an open follow-up
-          # window lands here) and pre-mark va_phase so the deferred
-          # `listening` emit isn't mistaken for an ambient window opening.
-          - lambda: |-
-              id(followup_listening) = false;
-              id(va_phase) = "waiting";
-              id(va)->start_session();
+          # Fresh turn — same path as the button press (see the start_turn
+          # script): clears the follow-up flag, pre-marks va_phase, beeps, and
+          # opens the mic once the beep's bus lock clears.
+          - script.execute: start_turn
 
 external_components:
   - source:
       type: local
       path: esphome/components
-    components: [va_client]
+    components: [va_client, udp_log]
 
 va_client:
   id: va
@@ -217,6 +332,26 @@ va_client:
           id(followup_listening) = false;
         }
         id(va_phase) = phase;
+    # Shared I2S bus is a mutex (see the speaker block): micro_wake_word holds
+    # the mic, so the speaker can't take the bus for the reply until mww
+    # releases it. Stop mww on `thinking` — the user's turn is already captured
+    # and the mic is idle — so the bus is free by the time `replying` starts and
+    # the speaker acquires it on the first try (no 1 s "bus busy" retry). Start
+    # it again on `idle`. Consequence: no wake-word/stop detection during a
+    # reply — impossible on a single-owner bus (barge-in was already unreliable
+    # here without AEC).
+    - if:
+        condition:
+          lambda: 'return phase == "thinking";'
+        then:
+          - micro_wake_word.stop
+    - if:
+        condition:
+          # Skip while a tone is mid-play — its on_finished_playback restarts
+          # mww; starting it here would grab the mic bus and cut the tone.
+          lambda: 'return phase == "idle" && !id(tone_playing);'
+        then:
+          - micro_wake_word.start
     - if:
         condition:
           lambda: 'return phase == "replying" || (phase == "listening" && id(followup_listening));'
@@ -225,25 +360,73 @@ va_client:
         else:
           - micro_wake_word.disable_model: stop
   on_followup_opened:
-    # Server-driven chimed follow-up (realtime.followUpChime). Without this
-    # handler the core would park in FollowupArmed forever waiting for
-    # commit_followup_mic(). No chime hardware ceremony on this device — just
-    # wait out the reply's DAC/room-echo tail (same 700 ms as va_core's
-    # kFollowupOpenDelayMs guard on the ambient path), then open the mic.
+    # Server-driven chimed follow-up (realtime.followUpChime). Wait out the
+    # reply's DAC/room-echo tail (700 ms, matching va_core's kFollowupOpenDelayMs
+    # ambient guard), then play a "your turn" chime; the mic is committed from
+    # on_finished_playback (pending_followup) once the chime ends and the bus is
+    # free — same handoff as the wake beep.
     - delay: 700ms
-    # Skip if something pre-empted the window during the delay (wake word /
-    # stop moved us off idle — commit_followup_mic() would no-op and the flag
-    # would go stale). Set the flag BEFORE commit: its phase emit is deferred,
-    # so on_phase runs after this script and arms `stop` from the flag.
+    # Skip if something pre-empted the window during the delay (wake word / stop
+    # moved us off idle — commit_followup_mic() would no-op).
     - if:
         condition:
           lambda: 'return id(va_phase) == "idle";'
         then:
           - lambda: |-
-              id(followup_listening) = true;
-              id(va)->commit_followup_mic();
+              id(tone_playing) = true;
+              id(pending_followup) = true;
+              id(pending_start_session) = false;
+          - micro_wake_word.stop
+          - delay: 300ms
+          - rtttl.play: "turn:d=16,o=6,b=220:e,g"
   on_repeated_failure:
     - logger.log: "va_client: repeated connection failure"
+    # Low double-blip so a silent device reads as "backend unreachable", not
+    # just idle. Local-only (no WS needed), so safe to play while disconnected.
+    - script.execute:
+        id: play_cue
+        song: "error:d=8,o=4,b=120:c,c"
+
+# Start a fresh turn — shared by the wake word and the button so both behave
+# identically: set the phase guard, then beep (start_session fires from rtttl's
+# on_finished_playback, once the beep ends and the bus is free) or, with no
+# beep enabled, open the mic right away.
+script:
+  - id: start_turn
+    then:
+      - lambda: |-
+          id(followup_listening) = false;
+          id(va_phase) = "waiting";
+      - if:
+          condition:
+            lambda: 'return id(va).wake_sound_enabled();'
+          then:
+            - lambda: |-
+                id(tone_playing) = true;
+                id(pending_start_session) = true;
+            - micro_wake_word.stop
+            # echo_mic releases the mutex a bit after mww STOPs, so wait before
+            # the speaker grabs the bus, else rtttl hits "Parent bus is busy".
+            - delay: 300ms
+            # number after a note is its OCTAVE (4-7), not duration.
+            - rtttl.play: "wake:d=16,o=6,b=170:c,e"
+          else:
+            - lambda: id(va)->start_session();
+
+  # Play a short confirmation tone with the same mutex-bus handoff as the wake
+  # beep, then return to idle listening. pending_start_session stays false, so
+  # on_finished_playback restarts mww but does NOT open a session.
+  - id: play_cue
+    mode: restart
+    parameters:
+      song: string
+    then:
+      - lambda: |-
+          id(tone_playing) = true;
+          id(pending_start_session) = false;
+      - micro_wake_word.stop
+      - delay: 300ms
+      - rtttl.play: !lambda 'return song;'
 
 binary_sensor:
   - platform: gpio
@@ -254,7 +437,24 @@ binary_sensor:
       mode:
         input: true
         pullup: true
-    on_press:
-      - lambda: |-
-          id(followup_listening) = false;
-          id(va)->send_interrupt();
+    # GPIO41 chatters — one physical press fired ~8 events; debounce to one.
+    filters:
+      - delayed_on_off: 20ms
+    # One button = toggle, like the classic Atom Echo: start a turn (with the
+    # wake beep) when idle, cancel the in-progress turn otherwise.
+    on_click:
+      min_length: 20ms
+      max_length: 2000ms
+      then:
+        - if:
+            condition:
+              lambda: 'return id(va_phase) == "idle";'
+            then:
+              - script.execute: start_turn
+            else:
+              - lambda: |-
+                  id(followup_listening) = false;
+                  id(va)->send_interrupt();
+              - script.execute:
+                  id: play_cue
+                  song: "cancel:d=16,o=5,b=200:g,e"

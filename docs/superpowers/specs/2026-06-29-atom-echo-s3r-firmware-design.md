@@ -1,8 +1,9 @@
 # Atom Echo S3R — thin-client voice firmware
 
 **Date:** 2026-06-29
-**Status:** Design approved, hardware not yet in hand (written blind, to be
-flashed and validated on arrival).
+**Status:** Validated on hardware 2026-07-06. The blind design flashed and ran,
+but several assumptions were wrong on real silicon — see "Hardware validation"
+at the end for the corrections (pinout, analog mic, shared-bus mutex, volume).
 
 ## Goal
 
@@ -147,3 +148,99 @@ Secrets reuse the existing `secrets.yaml` contract: `va_url`,
 `esphome compile home-assistant-voice.va-direct.yaml` must still succeed and
 the `va_client` `input_format` default must be `stereo32`, so the diff to the
 Voice PE runtime is zero.
+
+## Hardware validation (2026-07-06)
+
+Flashed on the real device. The end-to-end path works (wake word → listening →
+thinking → reply audio → idle), but the blind design had several wrong
+assumptions. Corrections now in `atom-echo-s3r.va-direct.yaml`:
+
+1. **Pinout (Risk #4) — the M5-docs GPIO map was wrong; the printed silkscreen
+   is authoritative.** Corrected against the device: I2C SCL `GPIO4→GPIO0`,
+   I2S LRCLK `GPIO11→GPIO3`, MCLK `GPIO18→GPIO11`, mic DIN (ASDOUT)
+   `GPIO0→GPIO4`, amp enable `GPIO3→GPIO18`. SDA (45), BCLK (17), DOUT/DSDIN
+   (48), button (41) were already correct. With the wrong SCL the I2C bus was
+   dead ("SCL held low, no devices") and the ES8311 never initialised.
+
+2. **Mic is ANALOG, not PDM (Risk #1 resolved).** `use_microphone: true` on the
+   esphome es8311 sets reg14 BIT(6) = *enable PDM digital microphone*, routing
+   the ADC to a PDM input this board doesn't have → silence. The analog ADC
+   path is enabled unconditionally in `es8311::setup()`, so the correct setting
+   is the default `use_microphone: false`.
+
+3. **The shared I2S bus is a MUTEX, not simultaneous full-duplex (Risk #2).**
+   `i2s_audio` guards the bus with `Mutex try_lock()`; mic and speaker cannot
+   own it at once. `timeout: never` on the speaker made it hold the bus forever
+   and starve the mic (endless "Driver failed to start"). Fix: finite speaker
+   timeout + stop `micro_wake_word` on `thinking` (frees the bus for the reply)
+   and restart it on `idle`. Consequence: no wake-word/stop detection during a
+   reply — impossible on a single-owner bus.
+
+4. **micro_wake_word start ordering.** mww finishes setup after `on_boot`
+   fires, so an `on_boot` start no-ops. Started instead from `on_phase`
+   (phase == "idle"), which also removes the need for a boot delay.
+
+5. **Speaker `channel: left`, not `mono`** — the ES8311 DAC expects a stereo
+   Philips frame; a mono frame is read at the wrong slot boundaries.
+
+6. **Playback volume must be pinned low.** No `media_player` here to drive
+   `va_client` volume (defaults to 1.0 = full scale), which overdrives the
+   NS4150B + tiny speaker into audible distortion. Set to ~0.06 in `on_boot`.
+
+7. **Gain staging.** `mic_gain: 36DB` + mww `gain_factor: 2`.
+
+8. **Wake-word detection was slow — the VAD gate was the culprit.** With
+   `vad:` enabled the VAD model consistently failed to confirm real speech on
+   this mic (wake model fired but VAD blocked → multi-second lag). The wake
+   model does NOT false-fire in silence here, so dropping `vad:` is safe and
+   makes detection near-instant.
+
+9. **Wake beep implemented (no LED exists to indicate listening).** Confirmed
+   the board has no controllable RGB LED — only the fixed boot/download LED —
+   so feedback is audible only. The beep is an `rtttl` playing through the raw
+   `i2s_speaker`, sequenced around the mutex bus: on wake, stop mww → let
+   echo_mic release the bus → `rtttl.play`; then in `on_finished_playback`
+   stop the speaker, restore its volume (see below), restart mww, and finally
+   `start_session`. Opening the mic from `on_finished_playback` (not a fixed
+   delay) guarantees the beep is done and the bus is free.
+
+10. **va_client does not start the mic** — it only registers a data callback
+    (`va_client.cpp:86`) and relies on micro_wake_word keeping `echo_mic`
+    capturing. So mww must be running during `listening`; the beep path
+    restarts it after the beep or the listening mic streams silence.
+
+11. **rtttl stomps the shared speaker's volume.** `rtttl.play` calls
+    `i2s_speaker->set_volume(gain)` (`rtttl.cpp:108`) and never restores it, so
+    the beep's gain sticks and attenuates every subsequent TTS reply. Fix:
+    restore `i2s_speaker` volume to 1.0 in `on_finished_playback`; the reply
+    level is then controlled solely by `va_client.set_volume` (≈0.12), and the
+    beep loudness solely by the rtttl `gain` (60%).
+
+Everything works end-to-end: wake → beep → listen → STT/LLM → spoken reply →
+follow-up. Remaining knobs are pure taste: reply volume (`set_volume`), beep
+volume (rtttl `gain`) and beep length (the rtttl string).
+
+## Button + audible cues (added after bring-up)
+
+- **Button (GPIO41) is a one-button toggle** (classic Atom Echo UX): tap in
+  idle starts a turn (via the shared `start_turn` script, same beep + mic
+  handoff as the wake word); tap mid-turn cancels (`send_interrupt`). GPIO41
+  chatters, so it's debounced (`delayed_on_off: 20ms`) and uses `on_click`.
+
+- **Audible cues** — the only feedback channel (no controllable LED). All go
+  through one `play_cue` script that reuses the wake-beep mutex handoff (stop
+  mww → tone → `on_finished_playback` restores speaker volume, restarts mww,
+  and runs the queued after-action). Two globals pick the after-action:
+  `pending_start_session` (wake/button start → open session) and
+  `pending_followup` (chimed follow-up → `commit_followup_mic`); cue tones
+  leave both false → just back to idle. `tone_playing` gates on_phase's
+  idle→mww.start so the phase machine doesn't grab the bus mid-tone.
+  - Wired: cancel/stop tone, connection-error blip (`on_repeated_failure`),
+    "your turn" follow-up chime (`on_followup_opened`, i.e. the server's
+    chimed follow-up only — the ambient silent window has no device hook).
+  - NOT done (needs a `va_core` C++ trigger, no yaml hook exists): a
+    "didn't catch that" tone on the no-speech watchdog, and a cue for the
+    ambient (silent) follow-up window.
+  - Caveat: `on_repeated_failure` can blip during a slow-WiFi boot (WS fails
+    a few times before WiFi is up); gate it on uptime if that becomes a
+    nuisance.

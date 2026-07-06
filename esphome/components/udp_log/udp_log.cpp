@@ -192,6 +192,17 @@ void UdpLog::on_log_(int level, const char *tag, const char *message, size_t len
                         esphome_level_to_name_(level));
   if (n > 0)
     p = static_cast<size_t>(n);
+  // Device name (App.get_name(), MAC-suffixed) so several speakers sharing
+  // one UDP sink stay distinguishable in Dozzle — ESPHome's formatted line
+  // carries no device identifier. Emitted as a self-closed JSON field.
+  if (p + 12 < sizeof(buf)) {
+    std::memcpy(buf + p, ",\"device\":\"", 11);
+    p += 11;
+  }
+  const std::string &device = App.get_name();
+  json_escape_(device.c_str(), device.size(), buf, sizeof(buf), &p);
+  if (p + 1 < sizeof(buf))
+    buf[p++] = '"';
   // pino-style time: epoch millis. Only emit if NTP has synced (timestamp
   // > 2020-01-01 sanity check); otherwise the reading is meaningless and
   // would confuse log viewers. millis()-since-boot can be inferred from
