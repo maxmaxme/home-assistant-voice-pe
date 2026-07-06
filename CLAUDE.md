@@ -29,13 +29,17 @@ There is no HA `voice_assistant` integration on the audio path
 anymore. STT/TTS happen inside the Realtime session in the backend;
 the device just streams mic audio up and plays speaker audio down.
 
-The firmware DOES keep a native `api:` connection to HA, but only as an
-**entity/announcement channel**: HA sees the device (Media Player, Mute,
-LED Ring, Wake word sensitivity, Restart) and can play announcements from
-scripts/automations (`tts.speak`, `media_player.play_media` with
-`announce: true`) through the announcement mixer input, concurrently with
-the assistant's voice. `reboot_timeout: 0s` — the voice path must survive
-HA being down, so the device never reboots on a missing API client.
+Both va-direct configs DO keep a native `api:` connection to HA, but only
+as an **entity/announcement channel**: HA sees the device and its
+`Media Player` entity and can play announcements from scripts/automations
+(`tts.speak`, `media_player.play_media` with `announce: true`) through the
+announcement mixer input, concurrently with the assistant's voice. On the
+Voice PE this also exposes Mute, LED Ring, Wake word sensitivity, Restart;
+on the Atom Echo the mixer + announcement chain was added for this (its
+shared-mutex I2S bus needs mww stop/start choreography around
+announcements — see `on_announcement` / `on_idle` in its media_player).
+`reboot_timeout: 0s` in both — the voice path must survive HA being down,
+so the device never reboots on a missing API client.
 
 ## Configs
 

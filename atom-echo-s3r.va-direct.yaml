@@ -13,11 +13,14 @@ esphome:
     priority: 375
     then:
       - switch.turn_on: speaker_amp
-      # va_client's TTS volume defaults to 1.0 (full scale); on this small
-      # DAC+NS4150B+speaker that clips into audible distortion. There's no
-      # media_player here to drive volume (unlike Voice PE), so pin a lower
-      # fixed level. Tune: raise if too quiet, lower if still harsh/clipping.
-      - lambda: id(va).set_volume(0.12);
+      # Seed va_client with the restored media_player volume (same pattern as
+      # the Voice PE config). The media_player owns the ES8311 DAC volume;
+      # va_client's software scale stacks on top so the assistant stays a bit
+      # quieter than full-scale announcements. The old fixed 0.12 pin is gone —
+      # the HA volume slider is the single loudness knob now.
+      - lambda: |-
+          id(va).set_volume(id(external_media_player).is_muted() ? 0.0f
+                                                                 : id(external_media_player).volume);
       # micro_wake_word is started from on_phase (phase == "idle") below, not
       # here: it finishes setup AFTER on_boot fires, so an on_boot start would
       # no-op with "hasn't been setup yet". The first idle phase (emitted early,
@@ -55,15 +58,17 @@ udp_log:
   level: DEBUG
   time_id: sntp_time
 
-# va-direct: no `api:` — HA never talks to this device (audio goes over the
-# va_client WS, tools go via the MCP server on the backend). mDNS only
-# advertises _esphomelib under USE_API, so advertise it manually or `esphome
-# run` can't discover the device for OTA upload. (Serial is the fallback.)
-mdns:
-  services:
-    - service: _esphomelib
-      protocol: _tcp
-      port: 6053
+# va-direct: `api:` is an entity/announcement channel only — the voice path
+# stays on the va_client WS. HA sees the device and its `Media Player`
+# entity, so scripts/automations can play announcements (tts.speak,
+# play_media with announce) through the mixer's announcement input. Also
+# restores stock mDNS advertisement for `esphome run` discovery.
+api:
+  id: api_id
+  encryption:  # Uses key set by Home Assistant
+  # Stock default (15min) reboots the device when no API client is connected.
+  # Here HA is optional — the voice path must survive HA being down.
+  reboot_timeout: 0s
 
 ota:
   - platform: esphome
@@ -156,13 +161,97 @@ speaker:
     # for the wake word; the speaker re-acquires it for each reply.
     # The 500 ms buffer still smooths WS-chunk jitter (hiss between chunks).
     buffer_duration: 500ms
+  # Mixer wraps the i2s leaf (same shape as the Voice PE config) so the
+  # va_client reply and an HA announcement can play concurrently instead of
+  # fighting over the leaf. The leaf's finite timeout still releases the
+  # mutex bus in idle so the mic can listen for the wake word.
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: i2s_speaker
+    num_channels: 1
+    task_stack_in_psram: true
+    source_speakers:
+      - id: va_mixing_input
+        timeout: never
+      - id: announcement_mixing_input
+        timeout: never
   # va_client writes 24 kHz mono PCM16 here; the resampler converts to the
   # 16 kHz hardware bus rate.
   - platform: resampler
     id: va_speaker
-    output_speaker: i2s_speaker
+    output_speaker: va_mixing_input
     sample_rate: 16000
     bits_per_sample: 16
+  - platform: resampler
+    id: announcement_speaker
+    output_speaker: announcement_mixing_input
+    sample_rate: 16000
+    bits_per_sample: 16
+
+media_source:
+  - platform: audio_http
+    id: http_announcement_source
+    buffer_size: 250000
+
+# HA-facing announcement player (tts.speak / play_media announce:true).
+# Voice replies do NOT go through it — va_client writes into va_speaker
+# directly — so this entity only ever announces.
+media_player:
+  - platform: speaker_source
+    id: external_media_player
+    name: Media Player
+    announcement_pipeline:
+      format: FLAC
+      num_channels: 1
+      sample_rate: 16000
+      speaker: announcement_speaker
+      sources:
+        - http_announcement_source
+    volume_increment: 0.05
+    # These land on the ES8311 DAC volume register, which is dB-LINEAR in the
+    # 0..1 value: 0.75 = 0 dB, 1.0 = +32 dB, each 0.01 ≈ 1.3 dB. Values below
+    # ~0.5 are effectively silence — do NOT treat this like a linear gain.
+    # min 0.75 (0 dB) .. max 0.9 (+20 dB) keeps the NS4150B amp out of hard
+    # clipping; volume_initial 0.75 ≈ the loudness of the old fixed va 0.12
+    # pin. Tune with the HA slider.
+    volume_min: 0.75
+    volume_max: 0.9
+    volume_initial: 0.75
+    # Mirror volume / mute into va_client's software scale (same as Voice PE)
+    # so the slider controls the assistant's voice too.
+    on_volume:
+      - lambda: |-
+          id(va).set_volume(id(external_media_player).is_muted() ? 0.0f
+                                                                 : id(external_media_player).volume);
+    on_mute:
+      - lambda: 'id(va).set_volume(0.0f);'
+    on_unmute:
+      - lambda: 'id(va).set_volume(id(external_media_player).volume);'
+    # Shared-mutex I2S bus: micro_wake_word holds the mic side, so the
+    # announcement pipeline can't take the bus until mww releases it (the
+    # speaker retries with "bus busy"). Mirror the reply-path choreography:
+    # stop mww when an announcement starts, restart it when the player goes
+    # idle — but only if the assistant is idle too and no tone owns the bus.
+    on_announcement:
+      - micro_wake_word.stop
+    on_idle:
+      # The pipeline goes IDLE while the leaf speaker is still draining its
+      # buffer (and holding the mutex bus for its timeout window). Starting
+      # mww right away fails with "Driver failed to start; retrying" spam —
+      # wait for the leaf to actually release the bus first.
+      - wait_until:
+          condition:
+            lambda: 'return id(i2s_speaker)->is_stopped();'
+          timeout: 5s
+      - if:
+          condition:
+            # Re-check after the wait: another announcement, a turn or a tone
+            # may have grabbed the bus meanwhile.
+            lambda: |-
+              return id(va_phase) == "idle" && !id(tone_playing) &&
+                     id(external_media_player).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_IDLE;
+          then:
+            - micro_wake_word.start
 
 switch:
   - platform: gpio
@@ -224,10 +313,12 @@ rtttl:
   on_finished_playback:
     - speaker.stop: i2s_speaker
     # rtttl calls i2s_speaker->set_volume(gain) (rtttl.cpp:108) and never
-    # restores it, so the beep's gain sticks and quietly attenuates every
-    # subsequent TTS reply on this shared speaker. Restore full speaker volume;
-    # the reply level is controlled by va_client's own set_volume.
-    - lambda: id(i2s_speaker)->set_volume(1.0f);
+    # restores it. Re-apply the media_player's volume (it owns the ES8311 DAC
+    # register) by re-setting it to its current value — a plain 1.0f restore
+    # would slam the DAC to +32 dB and clobber the slider setting.
+    - media_player.volume_set:
+        id: external_media_player
+        volume: !lambda 'return id(external_media_player).volume;'
     - delay: 150ms
     # va_client does NOT start the mic itself (it only registers a data
     # callback, va_client.cpp:86) — it relies on micro_wake_word keeping
