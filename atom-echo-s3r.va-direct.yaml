@@ -426,7 +426,7 @@ external_components:
 va_client:
   id: va
   url: ${va_url}
-  token: !secret va_device_token
+  token: !secret va_device_token_atom
   microphone: echo_mic
   mic_channel: 0
   input_format: mono16
