@@ -126,12 +126,18 @@ sides in lockstep when changing it.
 Several yaml blocks are marked `TODO va-direct` — features that were
 tied to the upstream `voice_assistant` component and don't apply here:
 
-- Timers (HA-managed timer UI / chimes).
 - Group media player (multi-room).
 - Music ducking (this firmware no longer plays music — voice-only).
 
 If/when these come back, they'll need a custom path through `va_client`
 or a sidecar HA integration.
+
+Timers were **removed** from `home-assistant-voice.va-direct.yaml`
+(the `timer_ringing` switch, `is_timer_active`/`first_active_timer`
+globals, the Timer Ring/Tick LED effects, the `ring_timer`/repeat/
+timer-query scripts, and the `timer_finished` sound) — they were dead
+weight with no `get_timers()` API on `va_client`. Re-adding them means
+a fresh custom path through `va_client`, not un-stubbing the old code.
 
 ## Secrets
 
