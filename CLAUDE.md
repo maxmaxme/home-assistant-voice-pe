@@ -35,9 +35,13 @@ as an **entity/announcement channel**: HA sees the device and its
 (`tts.speak`, `media_player.play_media` with `announce: true`) through the
 announcement mixer input, concurrently with the assistant's voice. On the
 Voice PE this also exposes Mute, LED Ring, Wake word sensitivity, Restart;
-on the Atom Echo the mixer + announcement chain was added for this (its
-shared-mutex I2S bus needs mww stop/start choreography around
-announcements — see `on_announcement` / `on_idle` in its media_player).
+on the Atom Echo the mixer + announcement/media chains were added for this
+(its shared-mutex I2S bus needs mww stop/start choreography around playback
+— see `on_announcement` / `on_play` / `on_idle` in its media_player; no
+wake word while media plays). The Atom also declares a media_pipeline so HA
+transcodes plain play_media (media library) to FLAC — only the FLAC decoder
+is compiled there, unlike the VPE where the mp3 chime file drags in the MP3
+codec and raw MP3 URLs happen to decode natively.
 `reboot_timeout: 0s` in both — the voice path must survive HA being down,
 so the device never reboots on a missing API client.
 
