@@ -29,6 +29,14 @@ There is no HA `voice_assistant` integration on the audio path
 anymore. STT/TTS happen inside the Realtime session in the backend;
 the device just streams mic audio up and plays speaker audio down.
 
+The firmware DOES keep a native `api:` connection to HA, but only as an
+**entity/announcement channel**: HA sees the device (Media Player, Mute,
+LED Ring, Wake word sensitivity, Restart) and can play announcements from
+scripts/automations (`tts.speak`, `media_player.play_media` with
+`announce: true`) through the announcement mixer input, concurrently with
+the assistant's voice. `reboot_timeout: 0s` — the voice path must survive
+HA being down, so the device never reboots on a missing API client.
+
 ## Configs
 
 | File | Purpose |
@@ -80,8 +88,8 @@ the device just streams mic audio up and plays speaker audio down.
 JSON messages (text frames) interleaved with binary PCM16:
 
 - **server → device**: `hello` (handshake ack; `{audioOut, wakeChime}` — the
-  wake-word beep is gated by `wakeChime`, since this firmware has no HA api /
-  web server to toggle it locally), `phase` (state transition), `error`,
+  wake-word beep is gated by `wakeChime`; the web panel is the single source
+  of truth for that knob, there is no local switch), `phase` (state transition), `error`,
   `follow_up` (`{ms, chime?}` sent right before the end-of-turn `idle`
   after a spoken reply; `chime:true` = play the "your turn" chime — see the
   follow-up section).

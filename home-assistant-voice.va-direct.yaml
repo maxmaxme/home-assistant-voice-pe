@@ -131,20 +131,19 @@ ota:
   - platform: esphome
     id: ota_esphome
 
-# va-direct: we removed `api:` (HA no longer talks to this device — audio
-# goes over va_client WS, tools go via the MCP server on the backend), but
-# ESPHome's mDNS only advertises `_esphomelib._tcp` under USE_API. Without
-# that service `esphome run`'s mDNS browse can't find us and prints
-# "no devices matching ...local were discovered" → "no valid options for
-# upload/logging". Advertise the service manually so OTA upload works.
-# Post-upload log streaming over API still won't work (nothing listens on
-# 6053), but `udp_log:` below ships logs to Dozzle on the Pi anyway, and
-# serial is always available as a fallback.
-mdns:
-  services:
-    - service: _esphomelib
-      protocol: _tcp
-      port: 6053
+# va-direct: `api:` is back, but ONLY as an entity/announcement channel —
+# the voice path stays on the va_client WS; HA has no voice_assistant role
+# here. Re-added so HA sees the device and its `Media Player` entity, letting
+# scripts/automations play announcements (tts.speak, play_media with
+# announce) through the existing announcement mixer input without touching
+# the assistant's audio. Also restores stock mDNS advertisement, so the
+# manual `_esphomelib._tcp` workaround for `esphome run` discovery is gone.
+api:
+  id: api_id
+  encryption:  # Uses key set by Home Assistant
+  # Stock default (15min) reboots the device when no API client is connected.
+  # Here HA is optional — the voice path must survive HA being down.
+  reboot_timeout: 0s
 
 # va-direct: WiFi provisioning blocks moved out of factory.yaml into the main
 # config since we don't use the upstream two-tier factory build.
@@ -270,10 +269,10 @@ switch:
       - script.execute: control_leds
     on_turn_off:
       - script.execute: control_leds
-  # Wake-word beep is server-driven now: gated by id(va)->wake_sound_enabled(),
+  # Wake-word beep is server-driven: gated by id(va)->wake_sound_enabled(),
   # set from the voice-assistant `hello` (realtime.wakeChime). The old local
-  # `wake_sound` template switch was dead weight here — this firmware has no
-  # HA api / web_server, so nothing could ever toggle it.
+  # `wake_sound` template switch stays removed even with `api:` back — the
+  # web panel is the single source of truth for this knob.
   - platform: gpio
     pin: GPIO47
     id: internal_speaker_amp
@@ -1432,12 +1431,11 @@ media_player:
     volume_min: 0.4
     volume_max: 0.85
     # Mirror the media_player volume / mute state into va_client so the
-    # device's physical +/- buttons and mute switch scale our TTS output.
-    # (No api: block on this firmware — there's no HA-side slider, the
-    # media_player exists only inside ESPHome.) Without this hook va_client
-    # writes into media_resampling_speaker bypassing the media_player, so
-    # the volume control would only affect chime announcements (wake /
-    # mute / error) — not the assistant's voice.
+    # physical +/- buttons, mute switch AND the HA-side volume slider all
+    # scale our TTS output. Without this hook va_client writes into
+    # media_resampling_speaker bypassing the media_player, so the volume
+    # control would only affect announcements (HA scripts, wake / mute /
+    # error chimes) — not the assistant's voice.
     on_volume:
       - lambda: |-
           id(va).set_volume(id(external_media_player).is_muted() ? 0.0f
