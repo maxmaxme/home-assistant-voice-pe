@@ -55,7 +55,7 @@ so the device never reboots on a missing API client.
 | `home-assistant-voice.8mb.yaml`, `home-assistant-voice.factory.yaml` | Other upstream variants — unused here. |
 | `atom-echo-s3r.va-direct.yaml` | Thin-client config for the **M5Stack Atom Echo S3R** (ESP32-S3-PICO, ES8311 mono codec, no XMOS). Reuses `va_client` with `input_format: mono16`; single full-duplex 16 kHz I2S bus + resampler. No LED ring/timers/Improv. See `docs/superpowers/specs/2026-06-29-atom-echo-s3r-firmware-design.md`. |
 | `voice-kit.yaml` | XMOS voice-kit component. Shared between configs. |
-| `secrets.yaml` | **Gitignored.** Holds `va_url` (e.g. `ws://va.local:3001/voice`) and `va_device_token` (this device's own bearer; must be registered as a `voice` device for some user in the backend — see below). |
+| `secrets.yaml` | **Gitignored.** Holds `va_url` (e.g. `ws://va.local:3001/voice`), `va_device_token` (the Voice PE's own bearer) and `va_device_token_atom` (the Atom Echo's own bearer) — each must be registered as a `voice` device for some user in the backend (see below). |
 
 ## Custom component: `esphome/components/va_client/`
 
@@ -161,14 +161,19 @@ a fresh custom path through `va_client`, not un-stubbing the old code.
 `secrets.yaml` is gitignored. Required keys:
 
 - `va_url` — backend WebSocket URL, e.g. `ws://va.local:3001/voice`.
-- `va_device_token` — this device's own bearer token. The backend
-  authenticates it **per device against the DB**, not a shared env value:
-  on the WS handshake it hashes the presented token and looks up a `voice`
-  identity. So the token must be **registered as a voice device** for some
-  user — via the web panel's Users page (add a voice device) or
+- `va_device_token` — the Voice PE's own bearer token (used by
+  `home-assistant-voice.va-direct.yaml`). The backend authenticates it
+  **per device against the DB**, not a shared env value: on the WS handshake
+  it hashes the presented token and looks up a `voice` identity. So the token
+  must be **registered as a voice device** for some user — via the web panel's
+  Users page (add a voice device) or
   `npm run users -- attach-voice --user <id> --token <this-token>`. There is
   no longer a `VA_DEVICE_TOKEN` env on the backend; each speaker can carry its
   own distinct token.
+- `va_device_token_atom` — the Atom Echo's own bearer token (used by
+  `atom-echo-s3r.va-direct.yaml`). Same story as above: a distinct token
+  registered as its own `voice` device. Each speaker config references its
+  own key, so CI's stub `secrets.yaml` must define both.
 - All upstream secrets (WiFi creds, etc.) stay as in stock.
 
 If the token isn't a registered voice device, the backend rejects the WS
