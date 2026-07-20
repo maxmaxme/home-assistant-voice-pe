@@ -52,11 +52,13 @@ jobs:
       - name: 🔧 Install esphome
         run: pip install esphome==2026.6.4
       - name: 🔑 Stub secrets
-        # va_device_token (Voice PE) and va_device_token_atom (Atom Echo) are the
-        # only !secrets the va-direct configs reference; any value compiles —
-        # real tokens never enter CI.
+        # va_device_token (Voice PE), va_device_token_atom (Atom Echo) and
+        # ap_password (both configs' fallback AP) are the !secrets the
+        # va-direct configs reference; any value compiles — real
+        # tokens/passwords never enter CI.
         run: |
           echo 'va_device_token: "ci-build-stub"' > secrets.yaml
           echo 'va_device_token_atom: "ci-build-stub"' >> secrets.yaml
+          echo 'ap_password: "ci-build-stub"' >> secrets.yaml
       - name: 🔨 Compile
         run: esphome compile ${{ matrix.file }}

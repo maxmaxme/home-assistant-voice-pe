@@ -174,7 +174,16 @@ a fresh custom path through `va_client`, not un-stubbing the old code.
   `atom-echo-s3r.va-direct.yaml`). Same story as above: a distinct token
   registered as its own `voice` device. Each speaker config references its
   own key, so CI's stub `secrets.yaml` must define both.
+- `ap_password` — shared password for both configs' fallback AP
+  (`"Voice PE Setup"` / `"${friendly_name} Setup"`), used together with
+  `captive_portal:` to reconfigure Wi-Fi without a full reflash.
 - All upstream secrets (WiFi creds, etc.) stay as in stock.
+
+**Whenever a va-direct yaml starts referencing a new `!secret` key**, add it
+to the CI stub too (`.github/workflows/build-va-direct.yml`, the "🔑 Stub
+secrets" step) in the same change — otherwise `esphome compile` fails there
+with "Secret '<name>' not defined" even though it compiles fine locally
+against the real `secrets.yaml`.
 
 If the token isn't a registered voice device, the backend rejects the WS
 upgrade with `4401` and the failure counter trips after a few retries.
