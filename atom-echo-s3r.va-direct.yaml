@@ -84,6 +84,7 @@ safe_mode:
 wifi:
   ap:
     ssid: "${friendly_name} Setup"
+    password: !secret ap_password
 captive_portal:
 
 # Pinout corrected against the device's printed silkscreen (the design-doc

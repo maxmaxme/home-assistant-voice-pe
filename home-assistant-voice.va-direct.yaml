@@ -14,8 +14,6 @@ substitutions:
   voice_assist_not_ready_phase_id: '10'
   # The voice assistant encountered an error
   voice_assist_error_phase_id: '11'
-  # Change this to true in case you ahve a hidden SSID at home.
-  hidden_ssid: "false"
   # Substitutions for audio files
   jack_connected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_connected.flac
   jack_disconnected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_disconnected.flac
@@ -98,11 +96,15 @@ esp32:
 
 wifi:
   id: wifi_id
-  fast_connect: ${hidden_ssid}
-  # va-direct: provisioning happens via improv (BLE/serial). Once provisioned,
+  # Skips the full multi-channel scan before connecting — that scan was what made
+  # the SoftAP fallback flaky (radio busy hopping channels instead of holding the AP).
+  fast_connect: true
+  # va-direct: provisioning happens via improv (BLE/serial) or, as a fallback,
+  # by joining this AP and using the captive portal below. Once provisioned,
   # credentials live in NVS — no inline ssid/password in this yaml.
   ap:
     ssid: "Voice PE Setup"
+    password: !secret ap_password
   on_connect:
     - delay: 5s  # give improv results time to transmit
     - ble.disable:
@@ -119,8 +121,7 @@ wifi:
   on_disconnect:
     - script.execute: control_leds
 
-network:
-  enable_ipv6: true
+captive_portal:
 
 logger:
   level: DEBUG
