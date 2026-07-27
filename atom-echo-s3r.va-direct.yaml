@@ -13,6 +13,24 @@ esphome:
     priority: 375
     then:
       - switch.turn_on: speaker_amp
+      # ES8311 ADC digital volume (reg 0x17), raised above the 0xC8 the esphome
+      # es8311 component hardcodes. The uplink to the backend gets NO digital
+      # boost anywhere else: micro_wake_word's `gain_factor` applies only to its
+      # own MicrophoneSource copy, and va_client forwards the raw mic frames —
+      # hence "wake fires but the model only hears me from half a metre". This
+      # register sits before the I2S bus, so it lifts both paths.
+      # Scale: gain_dB = -95.5 + 0.5 * N. 0xC8 = +4.5 dB (component default),
+      # 0xE0 = +16.5 dB, 0xFF = +32 dB (the register's ceiling). 0xE0 is the
+      # measured sweet spot: 0xF0 (+24 dB) made recognition audibly WORSE — this
+      # gain sits after the ADC, so on top of the 42DB analog PGA it clips
+      # close-range speech and lifts room noise into the server VAD. Do not
+      # chase distance with this register past 0xE0; the ceiling here is
+      # headroom, not sensitivity.
+      # Runs at priority 375, i.e. after the codec's own setup() at DATA.
+      - lambda: |-
+          const uint8_t adc_volume[2] = {0x17, 0xE0};
+          auto err = id(bus_a)->write(0x18, adc_volume, 2);
+          ESP_LOGI("mic_gain", "ES8311 ADC volume 0x%02X -> i2c err %d", adc_volume[1], (int) err);
       # Seed va_client with the restored media_player volume (same pattern as
       # the Voice PE config). The media_player owns the ES8311 DAC volume;
       # va_client's software scale stacks on top so the assistant stays a bit
@@ -102,12 +120,12 @@ audio_dac:
     address: 0x18
     sample_rate: 16000
     bits_per_sample: 16bit
-    # Analog PGA gain (default 42DB max). Feeds both the STT uplink and the
-    # wake-word path — more gain = easier wake/VAD detection. (The reply-audio
-    # distortion we chased earlier was the SPEAKER volume, not this.) 36DB is a
-    # solid middle; lower toward 24DB if the uplink audio distorts, raise to
-    # 42DB if wake detection stays weak.
-    mic_gain: 36DB
+    # Analog PGA gain (42DB is the component max). Feeds both the STT uplink and
+    # the wake-word path — more gain = easier wake/VAD detection. (The
+    # reply-audio distortion we chased earlier was the SPEAKER volume, not
+    # this.) At 36DB the uplink was too quiet from across the room; step back
+    # toward 36/30DB if close-range speech starts clipping.
+    mic_gain: 42DB
     # Do NOT set use_microphone: true here. In the esphome es8311 component
     # that flag sets reg14 BIT(6) = "enable PDM digital microphone", routing
     # the ADC to the codec's PDM input. This board has an ANALOG MEMS mic, so
