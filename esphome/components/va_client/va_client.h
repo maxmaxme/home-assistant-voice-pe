@@ -80,6 +80,7 @@ class VaClient : public Component {
   void set_microphone(microphone::Microphone *m) { mic_ = m; }
   void set_mic_channel(uint8_t c) { mic_channel_ = c; }
   void set_mic_mono16(bool m) { mic_mono16_ = m; }
+  void set_mic_gain(uint8_t g) { mic_gain_ = g; }
   void set_speaker(speaker::Speaker *s) { speaker_ = s; }
   // Sets the output-volume multiplier applied to TTS in handle_binary_.
   // Driven from yaml by external_media_player's volume / mute state so the
@@ -166,6 +167,11 @@ class VaClient : public Component {
   std::string auth_header_;
   uint8_t mic_channel_{0};
   bool mic_mono16_{false};
+  // Mic input gain, applied in on_mic_data_ before the int16 narrowing. The
+  // XMOS output is quiet enough that OpenAI's server VAD misses speech at
+  // unity — micro_wake_word compensates with its own gain_factor on the same
+  // mic, which is why the wake word triggers but the streamed audio is faint.
+  uint8_t mic_gain_{1};
 
   microphone::Microphone *mic_{nullptr};
   speaker::Speaker *speaker_{nullptr};

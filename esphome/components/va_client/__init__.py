@@ -11,6 +11,7 @@ DEPENDENCIES = ["network", "microphone", "speaker"]
 CONF_TOKEN = "token"
 CONF_MICROPHONE = "microphone"
 CONF_MIC_CHANNEL = "mic_channel"
+CONF_MIC_GAIN = "mic_gain"
 CONF_INPUT_FORMAT = "input_format"
 CONF_SPEAKER = "speaker"
 
@@ -45,6 +46,9 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_TOKEN): cv.string,
         cv.Required(CONF_MICROPHONE): cv.use_id(microphone.Microphone),
         cv.Optional(CONF_MIC_CHANNEL, default=0): cv.int_range(min=0, max=1),
+        # Amplifies the mic stream sent upstream. Tune per unit — how quiet the
+        # XMOS output is depends on the room and mic placement.
+        cv.Optional(CONF_MIC_GAIN, default=1): cv.int_range(min=1, max=32),
         cv.Optional(CONF_INPUT_FORMAT, default="stereo32"): cv.enum(
             INPUT_FORMATS, lower=True
         ),
@@ -94,6 +98,7 @@ async def to_code(config):
     cg.add(var.set_url(config[CONF_URL]))
     cg.add(var.set_token(config[CONF_TOKEN]))
     cg.add(var.set_mic_channel(config[CONF_MIC_CHANNEL]))
+    cg.add(var.set_mic_gain(config[CONF_MIC_GAIN]))
     cg.add(var.set_mic_mono16(config[CONF_INPUT_FORMAT]))
 
     mic = await cg.get_variable(config[CONF_MICROPHONE])

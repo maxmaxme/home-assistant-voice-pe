@@ -61,7 +61,7 @@ so the device never reboots on a missing API client.
 
 | File | Role |
 | --- | --- |
-| `__init__.py` | ESPHome codegen + YAML schema. Configurable: `url`, `token`, `microphone`, `mic_channel`, `input_format` (`stereo32` default = XMOS stereo-int32; `mono16` = plain int16-mono codec like ES8311), `speaker`, `on_phase` (automation), `on_followup_opened` (automation), `on_repeated_failure` (automation). |
+| `__init__.py` | ESPHome codegen + YAML schema. Configurable: `url`, `token`, `microphone`, `mic_channel`, `mic_gain` (1–32, default 1 = no change; digital gain on the uplink), `input_format` (`stereo32` default = XMOS stereo-int32; `mono16` = plain int16-mono codec like ES8311), `speaker`, `on_phase` (automation), `on_followup_opened` (automation), `on_repeated_failure` (automation). |
 | `va_core.h` | **Functional core** (phase 1 split): the protocol state machine, all watchdog/deadline time math and server-JSON handling. Pure — no esp-idf / ESPHome / FreeRTOS includes, so it compiles and runs on the host (see Testing & CI below). Side effects only via an `Actions` list the shell executes. |
 | `va_client.h`, `va_client.cpp` | The **imperative shell**: WS transport (`esp_websocket_client`), mic/speaker audio plane, PSRAM ring, trigger firing. Marshals WS-task events onto the main loop via `defer()` — all text-frame handling runs on the main loop by design (the core is single-threaded). |
 | `automation.h` | `OnPhaseTrigger : Trigger<std::string>` (fires on every phase transition with the new phase name), `OnFollowupOpenedTrigger : Trigger<>` (fires when a **chimed** follow-up window opens — yaml owns the chime + echo-decay gate, then calls `commit_followup_mic()`), and `OnRepeatedFailureTrigger : Trigger<>` (fires when the failure counter trips). |
@@ -69,10 +69,17 @@ so the device never reboots on a missing API client.
 ### What `va_client.cpp` does
 
 - **Mic stream**: with `input_format: stereo32` (default) pulls int32
-  stereo frames from the microphone and drops to int16 mono via `>>16`
-  on the selected `mic_channel`; with `input_format: mono16` forwards
-  already-int16-mono frames as-is. Either way ships PCM16 over the WS as
-  binary frames.
+  stereo frames from the microphone and drops to int16 mono on the selected
+  `mic_channel`; with `input_format: mono16` forwards already-int16-mono
+  frames. Either way `mic_gain` scales the result (clamped, and on the
+  stereo32 path applied *before* the int16 narrowing so a quiet XMOS signal
+  is amplified from full resolution). Ships PCM16 over the WS as binary
+  frames. **Level is set per unit by measuring, not by ear** — the backend's
+  `MIC_DUMP_DIR` writes the exact uplink to WAV; the VPE measured 41 dB SNR
+  with 22 dB headroom (→ `mic_gain: 4`), the Atom Echo measured 7 dB SNR with
+  2.7% clipping from too much analog gain (→ PGA and ADC volume cut 24 dB,
+  `micro_wake_word`'s own `gain_factor` raised ×16 to compensate, since the
+  analog knobs feed the wake path too).
 - **Speaker playback**: incoming binary frames are PCM16 audio. A
   **2 MB PSRAM ring buffer** smooths jitter and lets us defer "ready"
   LED state until the buffer actually drains.

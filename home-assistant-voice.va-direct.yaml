@@ -1567,6 +1567,16 @@ va_client:
   token: !secret va_device_token
   microphone: i2s_mics
   mic_channel: 0
+  # Set from measured mic dumps (MIC_DUMP_DIR on the backend). The mic is clean
+  # — ~30 dB SNR over a -45 dBFS room floor — so this is purely about headroom,
+  # and the loudest thing on this mic is NOT the user: the local wake beep and
+  # the reply's AEC leak (~10x, see CLAUDE.md) both land around -8 dBFS RMS.
+  # ×4 was calibrated on a dump that happened to contain no reply echo and drove
+  # both of those into 0 dBFS clipping, feeding OpenAI a distorted copy of its
+  # own voice mid-reply — exactly what breaks VAD and barge-in. ×2 keeps ~6 dB
+  # of headroom over the echo while speech still peaks near -8 dBFS. Do not
+  # raise this without a dump that includes a spoken reply.
+  mic_gain: 2
   # Write raw PCM16 mono 24kHz into the media resampler. We can't share the
   # announcement lane with external_media_player — va_client grabs the
   # resampling speaker on setup and holds it, which prevents the upstream

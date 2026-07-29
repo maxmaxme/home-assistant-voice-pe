@@ -34,6 +34,7 @@
 #include "esphome/core/hal.h"
 #include "esphome/components/audio/audio.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include <esp_websocket_client.h>
@@ -743,7 +744,19 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
     send_samples = samples.size() / sizeof(int16_t);
     if (send_samples == 0)
       return;
-    send_data = reinterpret_cast<const int16_t *>(samples.data());
+    const auto *in16 = reinterpret_cast<const int16_t *>(samples.data());
+    if (this->mic_gain_ > 1) {
+      this->mono_buf_.resize(send_samples);
+      for (size_t i = 0; i < send_samples; i++) {
+        // clamp<int32_t> explicitly: int32_t is `long` on xtensa, so plain
+        // std::clamp can't deduce a common type with int literals.
+        this->mono_buf_[i] = static_cast<int16_t>(
+            std::clamp<int32_t>((int32_t) in16[i] * this->mic_gain_, -32768, 32767));
+      }
+      send_data = this->mono_buf_.data();
+    } else {
+      send_data = in16;
+    }
   } else {
     // i2s_mics yields interleaved stereo int32 frames: [L0_low,L0_high, R0_low,R0_high, L1..].
     // Each frame = 8 bytes (2ch × 4 bytes). We want one channel converted to
@@ -758,8 +771,12 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
 
     this->mono_buf_.resize(mono_samples);
     for (size_t i = 0; i < mono_samples; i++) {
-      int32_t s = in32[i * 2 + offset];
-      this->mono_buf_[i] = static_cast<int16_t>(s >> 16);
+      // Apply gain BEFORE narrowing to int16: >>8 first keeps 8 sub-int16 bits,
+      // so a quiet XMOS signal is amplified from real resolution instead of
+      // from an already-truncated (and quantization-noisy) int16. At gain 1 the
+      // two shifts collapse to the original >>16, bit for bit.
+      int32_t s = (int32_t)(in32[i * 2 + offset] >> 8) * this->mic_gain_ >> 8;
+      this->mono_buf_[i] = static_cast<int16_t>(std::clamp<int32_t>(s, -32768, 32767));
     }
     send_data = this->mono_buf_.data();
     send_samples = this->mono_buf_.size();

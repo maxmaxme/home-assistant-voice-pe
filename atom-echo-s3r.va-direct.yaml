@@ -20,15 +20,16 @@ esphome:
       # hence "wake fires but the model only hears me from half a metre". This
       # register sits before the I2S bus, so it lifts both paths.
       # Scale: gain_dB = -95.5 + 0.5 * N. 0xC8 = +4.5 dB (component default),
-      # 0xE0 = +16.5 dB, 0xFF = +32 dB (the register's ceiling). 0xE0 is the
-      # measured sweet spot: 0xF0 (+24 dB) made recognition audibly WORSE — this
-      # gain sits after the ADC, so on top of the 42DB analog PGA it clips
-      # close-range speech and lifts room noise into the server VAD. Do not
-      # chase distance with this register past 0xE0; the ceiling here is
-      # headroom, not sensitivity.
+      # 0xE0 = +16.5 dB, 0xFF = +32 dB (the register's ceiling).
+      # Back at the 0xC8 default after measuring an actual mic dump: at 0xE0 on
+      # top of the 42DB PGA the uplink was 2.7% clipped with only 7 dB between
+      # the hiss floor (-11.7 dBFS) and speech (-4.4 dBFS) — the chain was
+      # amplifying its own noise into the server VAD, not the room. Compare:
+      # the Voice PE measures 41 dB SNR on the same backend. Level is cheap to
+      # buy back digitally (va_client `mic_gain`); this SNR is not.
       # Runs at priority 375, i.e. after the codec's own setup() at DATA.
       - lambda: |-
-          const uint8_t adc_volume[2] = {0x17, 0xE0};
+          const uint8_t adc_volume[2] = {0x17, 0xC8};
           auto err = id(bus_a)->write(0x18, adc_volume, 2);
           ESP_LOGI("mic_gain", "ES8311 ADC volume 0x%02X -> i2c err %d", adc_volume[1], (int) err);
       # Seed va_client with the restored media_player volume (same pattern as
@@ -123,9 +124,12 @@ audio_dac:
     # Analog PGA gain (42DB is the component max). Feeds both the STT uplink and
     # the wake-word path — more gain = easier wake/VAD detection. (The
     # reply-audio distortion we chased earlier was the SPEAKER volume, not
-    # this.) At 36DB the uplink was too quiet from across the room; step back
-    # toward 36/30DB if close-range speech starts clipping.
-    mic_gain: 42DB
+    # this.) 42DB was picked by ear for distance and turned out to be well past
+    # the point where the analog chain's own noise dominates: 7 dB SNR and 2.7%
+    # clipping on a measured mic dump (see the ADC-volume note in on_boot).
+    # 30DB is the measured restart point — re-dump and compare SNR before
+    # moving it, and buy level back with va_client `mic_gain`, not here.
+    mic_gain: 30DB
     # Do NOT set use_microphone: true here. In the esphome es8311 component
     # that flag sets reg14 BIT(6) = "enable PDM digital microphone", routing
     # the ADC to the codec's PDM input. This board has an ANALOG MEMS mic, so
@@ -402,9 +406,13 @@ micro_wake_word:
     # esphome 2026.6+ fails config with a channels mismatch.
     channels: 0
     # Digital boost for the wake-word path only (does NOT affect the STT
-    # uplink). ×2 on top of the 36DB analog PGA helps mww/VAD confirm speech;
-    # raise toward 4 if wake detection is weak, drop to 1 if it false-triggers.
-    gain_factor: 2
+    # uplink). Raised ×16 in lockstep with the analog PGA (42→30DB) and the ADC
+    # volume (0xE0→0xC8) coming down by 24 dB total: those two feed BOTH paths,
+    # so without this the wake word would just stop hearing anyone. Net level
+    # into mww is unchanged — a noisier copy of the same level, which the wake
+    # model tolerates far better than the uplink did. Drop it if wake starts
+    # false-triggering.
+    gain_factor: 32
   stop_after_detection: false
   # No `vad:` gate: on this mic the VAD model consistently fails to confirm
   # real speech (wake model fires on "okay nabu" but VAD blocks it → multi-
@@ -449,6 +457,12 @@ va_client:
   microphone: echo_mic
   mic_channel: 0
   input_format: mono16
+  # Buys back the level the analog cut cost, WITHOUT re-amplifying the analog
+  # noise floor along the way and without touching the wake-word path (unlike
+  # the codec's ADC-volume register, which feeds both). Measured after the cut:
+  # speech peaked at -27 dBFS over a -41 dBFS floor, so ×8 (+18 dB) lands peaks
+  # near -9 dBFS with 9 dB of headroom left for close-range speech.
+  mic_gain: 8
   speaker: va_speaker
   on_phase:
     # Stop-model choreography (mirrors the Voice PE config): arm `stop` while
