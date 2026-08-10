@@ -496,7 +496,7 @@ TEST(wake_during_echo_guard_cancels_pending_window) {
   f.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000}");
   f.play_out();
   CHECK_EQ(f.core.state(), State::Idle);
-  // Fresh wake inside the 700 ms guard.
+  // Fresh wake inside the echo guard.
   f.tick(300);
   f.wake();
   CHECK_EQ(f.core.state(), State::Listening);

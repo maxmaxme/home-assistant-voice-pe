@@ -1640,7 +1640,7 @@ va_client:
     # Server's request_follow_up tool fired: va_core fires this right after
     # the reply's PSRAM ring drained (finish_drain_ → FollowupArmed) — there
     # is NO extra tail wait on the C++ side for the chimed path (the ambient
-    # path's kFollowupOpenDelayMs = 700 ms guard doesn't apply here). The mic
+    # path's kFollowupOpenDelayMs = 1500 ms guard doesn't apply here). The mic
     # is NOT yet open — we own the gating, exactly like the wake-word
     # handler. Play the chime, wait for it to actually finish through the
     # speaker, then tell va_client to open the mic. This keeps the listening

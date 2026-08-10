@@ -75,7 +75,14 @@ class VaCore {
   // Timing/threshold constants — same values and meanings as the pre-split
   // shell (see va_client.h history for the full rationale on each).
   static constexpr uint32_t kMaxFollowupMs = 30000;
-  static constexpr uint32_t kFollowupOpenDelayMs = 700;
+  // Measured from the drained signal, which fires ~600 ms BEFORE physical
+  // silence (has_buffered_data() sees the resampler + mixer rings, not the
+  // i2s 500 ms ring or the ~100 ms DAC tail). 700 ms therefore left only
+  // ~100 ms of real margin and the reply's own tail leaked through the XMOS
+  // AEC into server VAD as a phantom turn. 600 tail + 800 echo decay puts the
+  // ambient window on the same footing as the chimed path's 800 ms post-chime
+  // delay.
+  static constexpr uint32_t kFollowupOpenDelayMs = 1500;
   static constexpr uint32_t kNoSpeechTimeoutMs = 7000;
   static constexpr uint32_t kMaxListeningMs = 30000;
   static constexpr uint32_t kSpeakerStopTimeoutMs = 3000;
