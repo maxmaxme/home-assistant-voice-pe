@@ -34,11 +34,13 @@ as an **entity/announcement channel**: HA sees the device and its
 `Media Player` entity and can play announcements from scripts/automations
 (`tts.speak`, `media_player.play_media` with `announce: true`) through the
 announcement mixer input, concurrently with the assistant's voice. On the
-Voice PE this also exposes Mute, LED Ring, Wake word sensitivity, Restart;
+Voice PE this also exposes Mute, LED Ring, Restart;
 on the Atom Echo the mixer + announcement/media chains were added for this
 (its shared-mutex I2S bus needs mww stop/start choreography around playback
 — see `on_announcement` / `on_play` / `on_idle` in its media_player; no
-wake word while media plays). Both configs declare a media_pipeline too, so
+wake word while media plays). Both configs expose a `Wake word sensitivity`
+select (per-device probability cutoffs, `restore_value: true`) — the Atom's
+option set drops hey_mycroft, which it doesn't ship. Both configs declare a media_pipeline too, so
 HA transcodes plain play_media (media library) to FLAC instead of shipping
 the raw file. On the VPE the HA media path has its own mixer input
 (`ha_media_mixing_input`) — `media_mixing_input` belongs to va_client (the
