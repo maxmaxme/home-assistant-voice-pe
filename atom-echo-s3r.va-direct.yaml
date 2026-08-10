@@ -444,6 +444,11 @@ micro_wake_word:
           # opens the mic once the beep's bus lock clears.
           - script.execute: start_turn
 
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: config
+
 select:
   - platform: template
     name: "Wake word sensitivity"
