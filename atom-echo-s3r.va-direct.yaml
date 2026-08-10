@@ -511,8 +511,7 @@ va_client:
           - micro_wake_word.disable_model: stop
   on_followup_opened:
     # Server-driven chimed follow-up (realtime.followUpChime). Wait out the
-    # reply's DAC/room-echo tail (700 ms, matching va_core's kFollowupOpenDelayMs
-    # ambient guard), then play a "your turn" chime; the mic is committed from
+    # reply's DAC/room-echo tail, then play a "your turn" chime; the mic is committed from
     # on_finished_playback (pending_followup) once the chime ends and the bus is
     # free — same handoff as the wake beep.
     - delay: 700ms
