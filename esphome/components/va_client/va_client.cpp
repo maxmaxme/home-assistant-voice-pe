@@ -637,9 +637,8 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
     if (len == 0)
       return;
   }
-  // Apply user-controlled volume from external_media_player before writing to
-  // the ring. volume_ is set from yaml on every media_player volume / mute
-  // change. With vol ≤ 1 there is no mathematical way to overflow int16, but
+  // Apply the output multiplier (see set_volume — held at 1, 0 while muted;
+  // the real volume control is the codec). With vol ≤ 1 there is no way to overflow int16, but
   // we keep a defensive saturation + clipped_samples_ counter so any future
   // gain re-introduction shows up in the per-turn summary instead of silently
   // distorting.
@@ -840,6 +839,10 @@ void VaClient::send_interrupt() {
   this->run_core_([now = millis()](VaCore &core, Actions &out) {
     core.send_interrupt(now, out);
   });
+}
+
+void VaClient::on_mic_muted() {
+  this->run_core_([now = millis()](VaCore &core, Actions &out) { core.on_mic_muted(now, out); });
 }
 
 void VaClient::prepare_barge_in() {

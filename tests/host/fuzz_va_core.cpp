@@ -19,6 +19,14 @@
 //       with an older turn, changes nothing (proto-2 turn ids). The model
 //       tracks turns independently of the core: +1 per start_session(), and
 //       a turn is closed by any interrupt that did something.
+//   I7  the "stop" word is only armed when there is something to stop — a
+//       reply audible, or the mic open (in a follow-up window).
+//   I8  a center-button press during a turn always cancels it (never pauses
+//       HA media under a still-talking assistant).
+//   I9  muting the mic closes any listening window.
+//
+// Besides the raw API, events are routed the way the yaml routes them —
+// through wake_action() / button_action() — so the decisions are fuzzed too.
 //
 // Deterministic: a seeded PRNG drives everything; a failure prints the seed
 // and the tail of the event trace. FUZZ_SEEDS / FUZZ_STEPS env vars scale it.
@@ -36,6 +44,8 @@ using esphome::va_client::Action;
 using esphome::va_client::Actions;
 using esphome::va_client::VaCore;
 using AT = Action::Type;
+using esphome::va_client::ButtonAction;
+using esphome::va_client::WakeAction;
 
 namespace {
 
@@ -171,56 +181,121 @@ struct Sim {
     this->drain_actions();
   }
 
+  void do_interrupt(const char *label) {
+    this->core.send_interrupt(this->now, this->out);
+    if (!this->out.empty())
+      this->model_closed = true;  // it aborted a turn (idle is a no-op)
+    this->cancelled = true;
+    // A chime script already running keeps going; its late commit must no-op.
+    this->log(label);
+    this->drain_actions();
+  }
+
+  void do_barge_in(const char *label) {
+    if (this->wake_pending)
+      return;
+    this->fill = 0;  // yaml flushes the ring + stops the resampler
+    this->core.prepare_barge_in();
+    this->wake_pending = true;
+    this->wake_at = this->now + 400 + this->rand(600);
+    this->log(label);
+  }
+
+  // A wake-word detection routed the way the yaml does it: through
+  // wake_action(), then the chosen choreography.
+  void policy_wake_word() {
+    const bool is_stop = this->chance(40);
+    const bool armed = this->core.stop_word_armed();
+    // mww only reports "stop" while the model is armed; a stray one rarely.
+    if (is_stop && !armed && !this->chance(10))
+      return;
+    switch (this->core.wake_action(is_stop)) {
+      case WakeAction::Abort:
+        this->do_interrupt("yaml stop word -> abort");
+        break;
+      case WakeAction::BargeIn:
+        this->do_barge_in("yaml wake word -> barge-in");
+        break;
+      case WakeAction::Start:
+        this->wake();
+        this->log("yaml wake word -> start");
+        break;
+      case WakeAction::Ignore:
+      case WakeAction::NotConnected:
+        this->log("yaml wake word -> nothing");
+        break;
+    }
+  }
+
+  void policy_button() {
+    const bool announcing = this->chance(15);
+    const bool media = this->chance(40);
+    const ButtonAction a = this->core.button_action(announcing, media);
+    if (!announcing && this->core.has_turn() && a != ButtonAction::Cancel)
+      this->fail("I8: a press during a turn did not cancel it");
+    switch (a) {
+      case ButtonAction::Cancel:
+        this->do_interrupt("yaml button -> cancel");
+        break;
+      case ButtonAction::Start:
+        this->wake();
+        this->log("yaml button -> start");
+        break;
+      default:
+        this->log("yaml button -> media/announcement/nothing");
+        break;
+    }
+  }
+
   // One random event.
   void step() {
     const uint32_t r = this->rand(100);
-    if (r < 25) {
+    if (r < 22) {
       static const uint32_t kAdv[] = {0, 10, 50, 200, 700, 1600, 5000, 9000, 31000};
       const uint32_t ms = kAdv[this->rand(sizeof(kAdv) / sizeof(kAdv[0]))];
       this->advance(ms);
       this->log("advance " + std::to_string(ms));
-    } else if (r < 55) {
+    } else if (r < 50) {
       if (this->ws != Ws::Connected)
         return;
       this->random_server_message();
-    } else if (r < 63) {
-      // Wake word / center button start. yaml refuses (error chime) when the
-      // WS is down, but the flag can race the defer gap — allow it rarely.
+    } else if (r < 54) {
+      // Raw API, no policy in front: a start at any time. yaml refuses (error
+      // chime) when the WS is down, but the flag can race the defer gap.
       if (this->ws != Ws::Connected && !this->chance(10))
         return;
       this->wake();
-      this->log("wake");
-    } else if (r < 71) {
-      // Stop word / center-button cancel, from any phase.
-      this->core.send_interrupt(this->now, this->out);
-      if (!this->out.empty())
-        this->model_closed = true;  // it aborted a turn (idle is a no-op)
-      this->cancelled = true;
-      this->commit_pending = false;  // yaml clears followup_listening
-      this->log("interrupt");
-      this->drain_actions();
-    } else if (r < 75) {
-      // Barge-in: yaml only takes this path while it shows `replying`.
-      if (std::strcmp(this->core.current_phase(), "replying") != 0 || this->wake_pending)
-        return;
-      this->fill = 0;  // yaml flushes the ring + stops the resampler
-      this->core.prepare_barge_in();
-      this->wake_pending = true;
-      this->wake_at = this->now + 400 + this->rand(600);
-      this->log("barge-in prepare");
-    } else if (r < 83) {
+      this->log("raw wake");
+    } else if (r < 58) {
+      this->do_interrupt("raw interrupt");
+    } else if (r < 60) {
+      if (std::strcmp(this->core.current_phase(), "replying") == 0)
+        this->do_barge_in("raw barge-in prepare");
+    } else if (r < 68) {
       this->ws_event();
-    } else if (r < 92) {
+    } else if (r < 76) {
       // Reply audio arriving from the WS task (only when it would be kept).
       if (this->ws == Ws::Connected && this->core.accepts_reply_audio()) {
         this->fill += 2000 + this->rand(40000);
         this->log("audio in");
       }
-    } else {
+    } else if (r < 79) {
       // A yaml commit landing at an arbitrary time (stale chime script).
       this->core.commit_followup_mic(this->now, this->out);
       this->log("stray commit_followup_mic");
       this->drain_actions();
+    } else if (r < 88) {
+      this->policy_wake_word();
+    } else if (r < 95) {
+      this->policy_button();
+    } else {
+      this->core.on_mic_muted(this->now, this->out);
+      if (!this->out.empty())
+        this->model_closed = true;
+      this->log("mic muted");
+      this->drain_actions();
+      if (this->core.is_mic_streaming())
+        this->fail("I9: mic still streaming after the mic was muted");
     }
   }
 
@@ -351,6 +426,12 @@ struct Sim {
   void check_invariants() {
     if (this->core.is_mic_streaming() && std::strcmp(this->core.current_phase(), "listening") != 0)
       this->fail("I2: mic streaming while LED does not show listening");
+    if (this->core.stop_word_armed()) {
+      if (this->core.wake_action(true) != WakeAction::Abort)
+        this->fail("I7: stop word armed with nothing to stop");
+      if (!this->core.reply_audible() && !this->core.is_mic_streaming())
+        this->fail("I7: stop word armed while neither replying nor listening");
+    }
     this->check_quiescence();
   }
 };
@@ -380,6 +461,6 @@ int main() {
       }
     }
   }
-  std::printf("PASS fuzz: %u seeds x %u steps, invariants I1-I6 held\n", seeds, steps);
+  std::printf("PASS fuzz: %u seeds x %u steps, invariants I1-I9 held\n", seeds, steps);
   return 0;
 }

@@ -60,6 +60,27 @@ struct Action {
 
 using Actions = std::vector<Action>;
 
+// What a wake-word detection should do, decided from the core's own state so
+// yaml never has to reconstruct it from LED globals. yaml owns only the
+// choreography for each answer (chimes, delays, speaker stops).
+enum class WakeAction : uint8_t {
+  Ignore,        // "stop" with no turn to stop
+  Abort,         // "stop" during a turn → send_interrupt()
+  BargeIn,       // wake word while a reply is audible → flush, prepare, chime, start
+  Start,         // wake word otherwise → chime, start_session()
+  NotConnected,  // wake word with the backend down → error chime, no session
+};
+
+// What a single press of the center button should do. Inputs the core can't
+// see (the HA media player) are passed in by yaml.
+enum class ButtonAction : uint8_t {
+  StopAnnouncement,  // an HA announcement is playing → stop it
+  Cancel,            // a turn is in progress → send_interrupt()
+  PauseMedia,        // only HA media is playing → pause it
+  Start,             // nothing going on → start a turn
+  NotConnected,      // would start, but the backend is down → error chime
+};
+
 class VaCore {
  public:
   // Mirrors the shell's original state machine one-to-one.
@@ -298,6 +319,7 @@ class VaCore {
     this->listen_max_armed_ = false;
     out.push_back({Action::Type::FlushAudioQueue, nullptr});
     this->send_start_(out);
+    this->followup_turn_ = false;  // a fresh turn, even from inside a window
     this->transition_(State::Listening, kPhaseListening, now, out);
     this->no_speech_at_ = now + kNoSpeechTimeoutMs;
     this->no_speech_armed_ = true;
@@ -345,7 +367,16 @@ class VaCore {
   void prepare_barge_in() {
     this->cancel_followup_timers_();
     this->reset_turn_modifiers_();
+    this->followup_turn_ = false;
     this->state_ = State::Idle;
+  }
+
+  // Mic mute switched on. A listening window (wake, follow-up) would only
+  // stream zeros until a watchdog fires — end it now. A reply in progress is
+  // left alone: muting the mic must not silence the assistant.
+  void on_mic_muted(uint32_t now, Actions &out) {
+    if (this->state_ == State::Listening || this->state_ == State::FollowupArmed)
+      this->send_interrupt(now, out);
   }
 
   // yaml's on_followup_opened automation calls this after the chime + i2s
@@ -365,6 +396,57 @@ class VaCore {
     this->followup_window_armed_ = true;
     this->followup_window_guard_ = State::Listening;
     this->arm_listening_watchdog_(now);
+  }
+
+  // ---- Input policy (pure decisions for yaml) ---------------------------------
+
+  // A reply is still coming out of the speaker (or about to).
+  bool reply_audible() const {
+    return this->state_ == State::Replying || this->state_ == State::WaitingDrain;
+  }
+
+  // Some turn is in progress that a stop / cancel would end.
+  bool has_turn() const { return this->state_ != State::Idle; }
+
+  // Whether the "stop" wake-word model should be armed: while the assistant
+  // is audible, or while the mic is open in a follow-up window (the user
+  // changed their mind). Never during the user's own fresh utterance (a false
+  // "stop" would kill it) or in idle silence.
+  bool stop_word_armed() const {
+    if (this->reply_audible())
+      return true;
+    if (!this->followup_turn_)
+      return false;
+    return this->state_ == State::Listening ||
+           (this->state_ == State::FollowupArmed && !this->followup_chime_pending_);
+  }
+
+  WakeAction wake_action(bool is_stop) const {
+    if (is_stop)
+      return this->has_turn() ? WakeAction::Abort : WakeAction::Ignore;
+    if (this->reply_audible())
+      return WakeAction::BargeIn;
+    return this->connected_ ? WakeAction::Start : WakeAction::NotConnected;
+  }
+
+  // Order matters: an announcement is the most recent sound, then the
+  // assistant's own turn — it must win over HA media, which plays on its own
+  // mixer lane concurrently (pausing the music while the assistant keeps
+  // talking was a bug) — and only then the media.
+  ButtonAction button_action(bool announcing, bool media_playing) const {
+    if (announcing)
+      return ButtonAction::StopAnnouncement;
+    if (this->has_turn())
+      return ButtonAction::Cancel;
+    if (media_playing)
+      return ButtonAction::PauseMedia;
+    return this->connected_ ? ButtonAction::Start : ButtonAction::NotConnected;
+  }
+
+  // The chimed follow-up handoff is still waiting for yaml's commit (nothing
+  // pre-empted the window while the chime played).
+  bool followup_commit_pending() const {
+    return this->state_ == State::FollowupArmed && this->followup_chime_pending_;
   }
 
   // ---- Queries ---------------------------------------------------------------
@@ -413,6 +495,12 @@ class VaCore {
   }
 
   void transition_(State next, const char *phase_label, uint32_t now, Actions &out) {
+    // A follow-up window opening marks the turn; it survives the commit and
+    // the server's speech-heard `listening`, and ends with anything else.
+    if (next == State::FollowupArmed)
+      this->followup_turn_ = true;
+    else if (next != State::Listening)
+      this->followup_turn_ = false;
     if (this->state_ != next) {
       this->state_ = next;
       this->state_entered_ms_ = now;
@@ -598,6 +686,10 @@ class VaCore {
   // (mic closed); false on the ambient path (mic open). Only meaningful in
   // FollowupArmed — both entry points set it.
   bool followup_chime_pending_{false};
+  // The current Listening / FollowupArmed came out of a follow-up window (vs
+  // a fresh wake). Arms the "stop" word over the window — see
+  // stop_word_armed(). Maintained by transition_().
+  bool followup_turn_{false};
 
   // millis() when audio_fill first hit 0 in WaitingDrain. 0 = not yet
   // emptied. Reset on every WaitingDrain entry (and via reset_turn_modifiers_)
