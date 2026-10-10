@@ -35,6 +35,7 @@
 #include "esphome/components/audio/audio.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 #include <esp_websocket_client.h>
@@ -139,9 +140,11 @@ void VaClient::execute_actions_(const Actions &actions) {
   for (const auto &a : actions) {
     switch (a.type) {
       case Action::Type::SendStart: {
-        static const char kMsg[] = "{\"type\":\"start\"}";
-        this->send_text_frame_(kMsg, sizeof(kMsg) - 1);
-        ESP_LOGD(TAG, "send start — WS msg sent");
+        char msg[48];
+        const int len =
+            snprintf(msg, sizeof(msg), "{\"type\":\"start\",\"turn\":%u}", (unsigned) a.turn);
+        this->send_text_frame_(msg, static_cast<size_t>(len));
+        ESP_LOGD(TAG, "send start (turn %u) — WS msg sent", (unsigned) a.turn);
         break;
       }
       case Action::Type::SendInterrupt: {
@@ -237,6 +240,11 @@ void VaClient::execute_actions_(const Actions &actions) {
           esp_websocket_client_close(
               static_cast<esp_websocket_client_handle_t>(this->ws_handle_), pdMS_TO_TICKS(1000));
         }
+        break;
+      }
+      case Action::Type::LogStaleDropped: {
+        ESP_LOGD(TAG, "dropped server message for stale turn %u (current %u)",
+                 (unsigned) a.turn, (unsigned) this->core_.current_turn());
         break;
       }
       case Action::Type::WarnProtoMismatch: {

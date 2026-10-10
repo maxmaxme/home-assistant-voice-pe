@@ -895,7 +895,7 @@ TEST(hello_proto_mismatch_warns_but_stays_connected) {
   Fixture f;
   f.connect();
   f.clear();
-  f.text("{\"type\":\"hello\",\"audioOut\":\"pcm\",\"proto\":2,\"wakeChime\":false}");
+  f.text("{\"type\":\"hello\",\"audioOut\":\"pcm\",\"proto\":3,\"wakeChime\":false}");
   CHECK_EQ(f.count(AT::WarnProtoMismatch), 1);
   CHECK_EQ(f.count(AT::CloseWsProtocolError), 0);
   CHECK(!f.core.wake_sound_enabled());  // hello still applied
@@ -905,7 +905,7 @@ TEST(hello_proto_matching_or_absent_is_silent) {
   Fixture f;
   f.connect();
   f.clear();
-  f.text("{\"type\":\"hello\",\"proto\":1}");
+  f.text("{\"type\":\"hello\",\"proto\":2}");
   f.text("{\"type\":\"hello\"}");
   CHECK_EQ(f.count(AT::WarnProtoMismatch), 0);
 }
@@ -964,6 +964,140 @@ TEST(new_turn_phases_clear_stale_followup_latch) {
   CHECK_EQ(f.core.state(), State::Idle);
   f.run_for(2000);
   CHECK_EQ(f.core.state(), State::Idle);  // no window opened
+}
+
+// ---- Turn ids (proto 2) ----------------------------------------------------------
+
+namespace {
+std::string tagged_phase(const char *p, uint32_t turn) {
+  return std::string("{\"type\":\"phase\",\"value\":\"") + p + "\",\"turn\":" +
+         std::to_string(turn) + "}";
+}
+uint32_t last_start_turn(const Fixture &f) {
+  uint32_t t = 0;
+  for (const auto &a : f.log)
+    if (a.type == AT::SendStart)
+      t = a.turn;
+  return t;
+}
+}  // namespace
+
+TEST(each_start_carries_a_fresh_turn_id) {
+  Fixture f;
+  f.connect();
+  f.wake();
+  const uint32_t first = last_start_turn(f);
+  CHECK(first != 0);
+  CHECK_EQ(f.core.current_turn(), first);
+  f.interrupt();
+  f.wake();
+  CHECK_EQ(last_start_turn(f), first + 1);
+}
+
+TEST(messages_tagged_with_the_open_turn_drive_it) {
+  Fixture f;
+  f.connect();
+  f.wake();
+  const uint32_t t = f.core.current_turn();
+  f.text(tagged_phase("listening", t));
+  f.text(tagged_phase("thinking", t));
+  CHECK_EQ(f.core.state(), State::Thinking);
+  CHECK_EQ(f.count(AT::LogStaleDropped), 0);
+}
+
+TEST(untagged_messages_still_work_for_a_proto1_server) {
+  Fixture f;
+  f.connect();
+  f.wake();
+  f.phase("thinking");
+  CHECK_EQ(f.core.state(), State::Thinking);
+}
+
+// The race turn ids exist for: the user says "stop", the device closes the
+// turn locally, and the bridge's reply / follow_up / idle for that turn are
+// still in flight. None of them may reopen or drive anything.
+TEST(late_messages_for_an_aborted_turn_are_dropped) {
+  Fixture f;
+  f.connect();
+  f.wake();
+  const uint32_t t = f.core.current_turn();
+  f.text(tagged_phase("thinking", t));
+  f.text(tagged_phase("replying", t));
+  f.interrupt();
+  CHECK_EQ(f.core.state(), State::Idle);
+  f.clear();
+
+  f.text(tagged_phase("replying", t));
+  f.text("{\"type\":\"follow_up\",\"ms\":8000,\"turn\":" + std::to_string(t) + "}");
+  f.text(tagged_phase("idle", t));
+  f.text("{\"type\":\"error\",\"message\":\"x\",\"turn\":" + std::to_string(t) + "}");
+  CHECK_EQ(f.core.state(), State::Idle);
+  CHECK(!f.core.accepts_reply_audio());
+  CHECK_EQ(f.count(AT::EmitPhase), 0);
+  CHECK_EQ(f.count(AT::FireRepeatedFailure), 0);  // no error chime after a stop
+  CHECK_EQ(f.count(AT::LogStaleDropped), 4);
+  f.run_for(VaCore::kFollowupOpenDelayMs + 9000);
+  CHECK_EQ(f.core.state(), State::Idle);
+  CHECK_EQ(f.count(AT::FireFollowupOpened), 0);
+}
+
+TEST(messages_for_a_previous_turn_cannot_drive_the_new_one) {
+  // Stop, then a quick re-wake: the bridge's late idle for the old turn lands
+  // while the new turn is listening — it must not close the new turn's mic.
+  Fixture f;
+  f.connect();
+  f.wake();
+  const uint32_t old_turn = f.core.current_turn();
+  f.interrupt();
+  f.wake();
+  CHECK_EQ(f.core.state(), State::Listening);
+  f.text(tagged_phase("idle", old_turn));
+  CHECK_EQ(f.core.state(), State::Listening);
+  CHECK(f.core.is_mic_streaming());
+}
+
+TEST(a_barge_in_moves_to_the_new_turn) {
+  Fixture f;
+  f.connect();
+  f.wake();
+  const uint32_t t1 = f.core.current_turn();
+  f.text(tagged_phase("replying", t1));
+  f.core.prepare_barge_in();
+  f.wake();
+  const uint32_t t2 = f.core.current_turn();
+  CHECK(t2 != t1);
+  f.text(tagged_phase("replying", t1));  // old reply's straggler
+  CHECK_EQ(f.core.state(), State::Listening);
+  f.text(tagged_phase("thinking", t2));
+  CHECK_EQ(f.core.state(), State::Thinking);
+}
+
+TEST(server_driven_followup_turn_keeps_the_turn_open) {
+  // A follow-up turn opened by speech (no start) is still tagged with the
+  // last start's id and must be accepted.
+  Fixture f;
+  f.connect();
+  f.wake();
+  const uint32_t t = f.core.current_turn();
+  f.text(tagged_phase("thinking", t));
+  f.text(tagged_phase("replying", t));
+  f.fill = 0;
+  f.drained = true;
+  f.text("{\"type\":\"follow_up\",\"ms\":8000,\"turn\":" + std::to_string(t) + "}");
+  f.text(tagged_phase("idle", t));
+  f.run_for(VaCore::kFollowupOpenDelayMs + 10);
+  CHECK_EQ(f.core.state(), State::FollowupArmed);
+  f.text(tagged_phase("listening", t));
+  CHECK_EQ(f.core.state(), State::Listening);
+}
+
+TEST(a_malformed_turn_tag_is_dropped) {
+  Fixture f;
+  f.connect();
+  f.wake();
+  f.text("{\"type\":\"phase\",\"value\":\"thinking\",\"turn\":\"x\"}");
+  f.text("{\"type\":\"phase\",\"value\":\"thinking\",\"turn\":-3}");
+  CHECK_EQ(f.core.state(), State::Listening);
 }
 
 int main() { return run_all_tests(); }

@@ -38,7 +38,7 @@ namespace va_client {
 // Actions vector for the component's lifetime).
 struct Action {
   enum class Type : uint8_t {
-    SendStart,           // send {"type":"start"} on the WS
+    SendStart,           // send {"type":"start","turn":<turn>} on the WS
     SendInterrupt,       // send {"type":"interrupt"} on the WS
     EmitPhase,           // fire on_phase triggers with `phase` (static string)
     FireFollowupOpened,  // fire on_followup_opened triggers (chimed follow-up)
@@ -49,9 +49,13 @@ struct Action {
     CloseWsProtocolError, // log an error and close the WS — server hello
                           //   announced an audio format we can't play
     WarnProtoMismatch,   // log a loud warning — server proto version differs
+    LogStaleDropped,     // diagnostics: dropped a server message tagged with
+                         //   a turn we already closed (or not ours); `turn`
+                         //   = the message's turn id
   };
   Type type;
   const char *phase{nullptr};  // EmitPhase only; points at a static literal
+  uint32_t turn{0};            // SendStart / LogStaleDropped only
 };
 
 using Actions = std::vector<Action>;
@@ -90,7 +94,7 @@ class VaCore {
   static constexpr uint32_t kStableConnectionMs = 30000;
   // Wire-protocol version this firmware speaks (see voice-assistant's
   // src/realtime/protocol.ts). A differing hello.proto only warns.
-  static constexpr uint32_t kProtoVersion = 1;
+  static constexpr uint32_t kProtoVersion = 2;
 
   // ---- Events (imperative shell → core) ------------------------------------
 
@@ -137,6 +141,17 @@ class VaCore {
 
     const char *type = doc["type"].as<const char *>();
     if (type == nullptr)
+      return;
+
+    // Turn-scoped messages (proto 2) name the turn they belong to. A message
+    // from a turn we already aborted locally — the bridge's answering idle, a
+    // reply or follow_up still in flight when the user said "stop" — or from
+    // a turn that isn't the current one is dropped whole: aborts are ours, so
+    // late server traffic can't reopen or drive a closed turn.
+    const bool turn_scoped = std::strcmp(type, "phase") == 0 ||
+                             std::strcmp(type, "follow_up") == 0 ||
+                             std::strcmp(type, "error") == 0;
+    if (turn_scoped && !this->accepts_turn_(doc, out))
       return;
 
     if (std::strcmp(type, "error") == 0) {
@@ -274,6 +289,10 @@ class VaCore {
   // Wake word fired — begin a fresh turn (also barges in: `start` cancels a
   // reply still in flight server-side, FlushAudioQueue drops the local tail).
   void start_session(uint32_t now, Actions &out) {
+    // A fresh turn id per start (never 0, so "no turn yet" stays distinct).
+    this->turn_seq_ = this->turn_seq_ + 1 == 0 ? 1 : this->turn_seq_ + 1;
+    this->current_turn_ = this->turn_seq_;
+    this->turn_closed_ = false;
     this->reset_turn_modifiers_();
     this->cancel_followup_timers_();
     this->listen_max_armed_ = false;
@@ -308,6 +327,8 @@ class VaCore {
     if (this->connected_)
       out.push_back({Action::Type::SendInterrupt, nullptr});
     out.push_back({Action::Type::FlushAudioQueue, nullptr});
+    // Anything the server still sends for this turn is now stale.
+    this->turn_closed_ = true;
     this->reset_turn_modifiers_();
     this->no_speech_armed_ = false;
     this->listen_max_armed_ = false;
@@ -371,6 +392,8 @@ class VaCore {
   State state() const { return this->state_; }
   bool connected() const { return this->connected_; }
   const char *current_phase() const { return this->current_phase_; }
+  // Id of the turn the last start_session() opened (0 = none since boot).
+  uint32_t current_turn() const { return this->current_turn_; }
   // Exposed for tests / diagnostics.
   uint32_t consecutive_failures() const { return this->consecutive_failures_; }
   uint32_t server_follow_up_ms() const { return this->server_follow_up_ms_; }
@@ -401,7 +424,20 @@ class VaCore {
   void send_start_(Actions &out) {
     if (!this->connected_)
       return;
-    out.push_back({Action::Type::SendStart, nullptr});
+    out.push_back({Action::Type::SendStart, nullptr, this->current_turn_});
+  }
+
+  // Untagged messages pass (proto-1 server, or nothing started yet); tagged
+  // ones only for the current, still-open turn. A malformed tag is dropped.
+  bool accepts_turn_(JsonDocument &doc, Actions &out) const {
+    JsonVariant tag = doc["turn"];
+    if (tag.isNull())
+      return true;
+    const uint32_t turn = tag.is<uint32_t>() ? tag.as<uint32_t>() : 0;
+    if (turn != 0 && turn == this->current_turn_ && !this->turn_closed_)
+      return true;
+    out.push_back({Action::Type::LogStaleDropped, nullptr, turn});
+    return false;
   }
 
   void arm_listening_watchdog_(uint32_t now) {
@@ -549,6 +585,12 @@ class VaCore {
 
   bool connected_{false};
   bool wake_sound_enabled_{true};
+
+  // Turn ids (proto 2): turn_seq_ counts start_session() calls, current_turn_
+  // is the open (or last) turn, turn_closed_ = we aborted it locally.
+  uint32_t turn_seq_{0};
+  uint32_t current_turn_{0};
+  bool turn_closed_{false};
 
   uint32_t server_follow_up_ms_{0};
   bool server_follow_up_chime_{false};
