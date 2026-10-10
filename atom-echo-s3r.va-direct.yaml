@@ -57,10 +57,9 @@ esphome:
       - lambda: |-
           id(va).set_volume(id(external_media_player).is_muted() ? 0.0f
                                                                  : id(external_media_player).volume);
-      # micro_wake_word is started from on_phase (phase == "idle") below, not
+      # micro_wake_word is started by bus_reconcile (the 100 ms interval), not
       # here: it finishes setup AFTER on_boot fires, so an on_boot start would
-      # no-op with "hasn't been setup yet". The first idle phase (emitted early,
-      # even before the WS connects) starts it — no boot delay needed.
+      # no-op with "hasn't been setup yet". The reconcile waits for is_ready().
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -292,36 +291,17 @@ media_player:
       - lambda: 'id(va).set_volume(0.0f);'
     on_unmute:
       - lambda: 'id(va).set_volume(id(external_media_player).volume);'
-    # Shared-mutex I2S bus: micro_wake_word holds the mic side, so the
-    # announcement pipeline can't take the bus until mww releases it (the
-    # speaker retries with "bus busy"). Mirror the reply-path choreography:
-    # stop mww when an announcement starts, restart it when the player goes
-    # idle — but only if the assistant is idle too and no tone owns the bus.
+    # Shared-mutex I2S bus: HA media needs the speaker side, so the mic
+    # (micro_wake_word) must let go — bus_reconcile reads the player's state
+    # (announcing / playing / paused all count) and does that, and restarts
+    # the mic once the player is idle AND the leaf has released the bus.
+    # Reconciling right away here just saves the announcement up to one
+    # 100 ms tick of "bus busy" retries. Consequence of the single-owner bus:
+    # no wake word while media is playing OR paused.
     on_announcement:
-      - micro_wake_word.stop
-    # Media playback needs the same handoff. Consequence of the single-owner
-    # bus: no wake word while media is playing OR paused — stop/cancel via HA
-    # or the button.
+      - script.execute: bus_reconcile
     on_play:
-      - micro_wake_word.stop
-    on_idle:
-      # The pipeline goes IDLE while the leaf speaker is still draining its
-      # buffer (and holding the mutex bus for its timeout window). Starting
-      # mww right away fails with "Driver failed to start; retrying" spam —
-      # wait for the leaf to actually release the bus first.
-      - wait_until:
-          condition:
-            lambda: 'return id(i2s_speaker)->is_stopped();'
-          timeout: 5s
-      - if:
-          condition:
-            # Re-check after the wait: another announcement, a turn or a tone
-            # may have grabbed the bus meanwhile.
-            lambda: |-
-              return id(va_phase) == "idle" && !id(tone_playing) &&
-                     id(external_media_player).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_IDLE;
-          then:
-            - micro_wake_word.start
+      - script.execute: bus_reconcile
 
 switch:
   - platform: gpio
@@ -331,33 +311,32 @@ switch:
     internal: true
 
 globals:
-  # Last phase reported by va_client's on_phase. Lets yaml tell a follow-up
-  # window opening (listening arriving out of idle without a local
-  # start_session) apart from a normal turn — this device has no LED phase
-  # global to consult like the Voice PE config.
-  - id: va_phase
-    type: std::string
+  # Who may hold the shared I2S bus — mic (micro_wake_word, which also feeds
+  # va_client's uplink) or speaker (reply, rtttl tones, HA media). va_client's
+  # bus_arbiter.h, host-tested: yaml reports facts (phase, tones) and
+  # bus_reconcile turns its mic_wanted() into mww.start/stop, so one missed
+  # callback can't leave the device deaf or the bus contended.
+  - id: bus
+    type: va_client::BusArbiter
     restore_value: no
-    initial_value: '"idle"'
-  # True while any rtttl tone (wake beep or a cue) is playing. on_phase's
-  # idle→mww.start is skipped while set, so the phase machine doesn't grab the
-  # mic bus mid-tone; the tone's own on_finished_playback restarts mww.
-  - id: tone_playing
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  # True only for the wake/start beep: tells on_finished_playback to open the
-  # session mic after the tone. Cue tones leave it false (tone → back to idle).
-  - id: pending_start_session
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  # Like pending_start_session, but for the follow-up "your turn" chime: after
-  # the tone, commit the follow-up mic instead of a fresh session.
-  - id: pending_followup
-    type: bool
-    restore_value: no
-    initial_value: 'false'
+
+# Reconcile the bus every 100 ms: heals any missed edge, and ends a tone whose
+# finished callback never came (BusArbiter::kToneTimeoutMs) — previously a lost
+# callback left tone_playing stuck and the wake word deaf until reboot.
+interval:
+  - interval: 100ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(bus).tone_timed_out(millis());'
+          then:
+            - logger.log:
+                level: WARN
+                format: "rtttl tone never reported finishing — releasing the bus"
+            - rtttl.stop:
+                id: wake_beep
+            - script.execute: tone_done
+      - script.execute: bus_reconcile
 
 # Wake-word beep. Plays through the raw i2s_speaker (not the resampler/va_client
 # path) with its own low gain — va_client's TTS volume does NOT apply here.
@@ -367,45 +346,8 @@ rtttl:
   id: wake_beep
   speaker: i2s_speaker
   gain: 70%
-  # The mic can't take the mutex bus while the speaker still holds it after the
-  # beep (its 500 ms idle timeout), which was swallowing the user's first
-  # utterance. So open the session mic HERE, when the beep truly ends: force
-  # the speaker to release the bus, then start the session. Length-independent,
-  # no guessed delay.
   on_finished_playback:
-    - speaker.stop: i2s_speaker
-    # rtttl calls i2s_speaker->set_volume(gain) (rtttl.cpp:108) and never
-    # restores it. Re-apply the media_player's volume (it owns the ES8311 DAC
-    # register) by re-setting it to its current value — a plain 1.0f restore
-    # would slam the DAC to +32 dB and clobber the slider setting.
-    - media_player.volume_set:
-        id: external_media_player
-        volume: !lambda 'return id(external_media_player).volume;'
-    - delay: 150ms
-    # va_client does NOT start the mic itself (it only registers a data
-    # callback, va_client.cpp:86) — it relies on micro_wake_word keeping
-    # echo_mic capturing. We stopped mww for the beep, so restart it here or
-    # the listening mic streams silence and the server never hears the user.
-    # (mww is stopped again at `thinking` for the reply's bus handoff.)
-    - micro_wake_word.start
-    # Tone finished: clear the guard, and open the session mic only if this was
-    # a wake/start beep. Cue tones leave pending_start_session false → they just
-    # return to idle wake-word listening.
-    - lambda: id(tone_playing) = false;
-    - if:
-        condition:
-          lambda: 'return id(pending_start_session);'
-        then:
-          - lambda: |-
-              id(pending_start_session) = false;
-              id(va)->start_session();
-    - if:
-        condition:
-          lambda: 'return id(pending_followup);'
-        then:
-          - lambda: |-
-              id(pending_followup) = false;
-              id(va)->commit_followup_mic();
+    - script.execute: tone_done
 
 micro_wake_word:
   id: mww
@@ -453,9 +395,17 @@ micro_wake_word:
                     song: "cancel:d=16,o=5,b=200:g,e"
         else:
           # Fresh turn — same path as the button press (see the start_turn
-          # script): pre-marks va_phase, beeps, and opens the mic once the
-          # beep's bus lock clears.
-          - script.execute: start_turn
+          # script): beeps, and opens the mic once the beep's bus lock clears.
+          # Backend down: the error cue instead of pretending to listen.
+          - if:
+              condition:
+                lambda: 'return id(va)->wake_action(false) == va_client::WakeAction::NotConnected;'
+              then:
+                - script.execute:
+                    id: play_cue
+                    song: "error:d=8,o=4,b=120:c,c"
+              else:
+                - script.execute: start_turn
 
 button:
   - platform: restart
@@ -514,31 +464,18 @@ va_client:
   mic_gain: 8
   speaker: va_speaker
   on_phase:
+    # Shared I2S bus is a mutex (see the speaker block): the mic lets go from
+    # `thinking` on — the user's turn is already captured — so the bus is free
+    # by the time `replying` starts and the speaker gets it on the first try
+    # (no 1 s "bus busy" retry); it comes back at idle once the leaf releases
+    # the bus. Reconcile right away rather than on the next tick. Consequence:
+    # no wake-word/stop detection during a reply — impossible on a
+    # single-owner bus (barge-in was already unreliable here without AEC).
+    - lambda: id(bus).on_phase(phase.c_str());
+    - script.execute: bus_reconcile
     # Stop-model choreography (mirrors the Voice PE config): `stop` is armed
     # exactly when va_core's stop_word_armed() says there is something to stop
-    # (assistant audible, or the mic open in a follow-up window) — see the
-    # last `if` below.
-    - lambda: id(va_phase) = phase;
-    # Shared I2S bus is a mutex (see the speaker block): micro_wake_word holds
-    # the mic, so the speaker can't take the bus for the reply until mww
-    # releases it. Stop mww on `thinking` — the user's turn is already captured
-    # and the mic is idle — so the bus is free by the time `replying` starts and
-    # the speaker acquires it on the first try (no 1 s "bus busy" retry). Start
-    # it again on `idle`. Consequence: no wake-word/stop detection during a
-    # reply — impossible on a single-owner bus (barge-in was already unreliable
-    # here without AEC).
-    - if:
-        condition:
-          lambda: 'return phase == "thinking";'
-        then:
-          - micro_wake_word.stop
-    - if:
-        condition:
-          # Skip while a tone is mid-play — its on_finished_playback restarts
-          # mww; starting it here would grab the mic bus and cut the tone.
-          lambda: 'return phase == "idle" && !id(tone_playing);'
-        then:
-          - micro_wake_word.start
+    # (assistant audible, or the mic open in a follow-up window).
     - if:
         condition:
           lambda: 'return id(va)->stop_word_armed();'
@@ -548,9 +485,9 @@ va_client:
           - micro_wake_word.disable_model: stop
   on_followup_opened:
     # Server-driven chimed follow-up (realtime.followUpChime). Wait out the
-    # reply's DAC/room-echo tail, then play a "your turn" chime; the mic is committed from
-    # on_finished_playback (pending_followup) once the chime ends and the bus is
-    # free — same handoff as the wake beep.
+    # reply's DAC/room-echo tail, then play a "your turn" chime; tone_done
+    # commits the mic once the chime ends and the bus is free — same handoff
+    # as the wake beep.
     - delay: 700ms
     # Skip if something pre-empted the window during the delay (wake word /
     # stop / button — commit_followup_mic() would no-op).
@@ -558,11 +495,10 @@ va_client:
         condition:
           lambda: 'return id(va)->followup_commit_pending();'
         then:
-          - lambda: |-
-              id(tone_playing) = true;
-              id(pending_followup) = true;
-              id(pending_start_session) = false;
-          - micro_wake_word.stop
+          - lambda: id(bus).begin_tone(va_client::Tone::FollowupChime, millis());
+          - script.execute: bus_reconcile
+          # echo_mic releases the mutex a bit after mww STOPs, so wait before
+          # the speaker grabs the bus, else rtttl hits "Parent bus is busy".
           - delay: 300ms
           - rtttl.play: "turn:d=16,o=6,b=220:e,g"
   on_repeated_failure:
@@ -580,15 +516,12 @@ va_client:
 script:
   - id: start_turn
     then:
-      - lambda: id(va_phase) = "waiting";
       - if:
           condition:
             lambda: 'return id(va).wake_sound_enabled();'
           then:
-            - lambda: |-
-                id(tone_playing) = true;
-                id(pending_start_session) = true;
-            - micro_wake_word.stop
+            - lambda: id(bus).begin_tone(va_client::Tone::WakeBeep, millis());
+            - script.execute: bus_reconcile
             # echo_mic releases the mutex a bit after mww STOPs, so wait before
             # the speaker grabs the bus, else rtttl hits "Parent bus is busy".
             - delay: 300ms
@@ -598,19 +531,72 @@ script:
             - lambda: id(va)->start_session();
 
   # Play a short confirmation tone with the same mutex-bus handoff as the wake
-  # beep, then return to idle listening. pending_start_session stays false, so
-  # on_finished_playback restarts mww but does NOT open a session.
+  # beep, then return to idle listening. A cue replaces any tone in flight —
+  # a cancel during the wake beep means its session never opens.
   - id: play_cue
     mode: restart
     parameters:
       song: string
     then:
-      - lambda: |-
-          id(tone_playing) = true;
-          id(pending_start_session) = false;
-      - micro_wake_word.stop
+      - lambda: id(bus).begin_tone(va_client::Tone::Cue, millis());
+      - script.execute: bus_reconcile
       - delay: 300ms
       - rtttl.play: !lambda 'return song;'
+
+  # A tone is over (rtttl's on_finished_playback, or the interval's timeout).
+  # The mic can't take the mutex bus while the speaker still holds it after
+  # the tone (its 500 ms idle timeout), which used to swallow the user's first
+  # utterance — so force the speaker to release it right away, then hand the
+  # bus back and do what the tone was for. Length-independent, no guessed
+  # delay. `single`: a duplicate callback while this runs is dropped (and
+  # finish_tone() is idempotent anyway).
+  - id: tone_done
+    mode: single
+    then:
+      - lambda: id(bus).finish_tone();
+      - speaker.stop: i2s_speaker
+      # rtttl calls i2s_speaker->set_volume(gain) (rtttl.cpp:108) and never
+      # restores it. Re-apply the media_player's volume (it owns the ES8311 DAC
+      # register) by re-setting it to its current value — a plain 1.0f restore
+      # would slam the DAC to +32 dB and clobber the slider setting.
+      - media_player.volume_set:
+          id: external_media_player
+          volume: !lambda 'return id(external_media_player).volume;'
+      - delay: 150ms
+      # va_client does NOT start the mic itself (it only registers a data
+      # callback) — it relies on micro_wake_word keeping echo_mic capturing.
+      # So give the bus back to the mic BEFORE opening the session, or the
+      # listening mic streams silence and the server never hears the user.
+      - script.execute: bus_reconcile
+      - lambda: |-
+          switch (id(bus).take_after_tone()) {
+            case va_client::AfterTone::StartSession:
+              id(va)->start_session();
+              break;
+            case va_client::AfterTone::CommitFollowup:
+              id(va)->commit_followup_mic();
+              break;
+            default:
+              break;
+          }
+
+  # Turn bus_arbiter's mic_wanted() into micro_wake_word's actual state.
+  # start()/stop() are idempotent and asynchronous; anything that doesn't
+  # converge this tick (a start still pending, a stop racing a start) does on
+  # the next one.
+  - id: bus_reconcile
+    then:
+      - lambda: |-
+          if (!id(mww).is_ready() || id(mww).is_failed())
+            return;  // not set up yet (boot) — start() would only warn
+          const bool media_busy = id(external_media_player).state !=
+                                  media_player::MediaPlayerState::MEDIA_PLAYER_STATE_IDLE;
+          const bool want = id(bus).mic_wanted(media_busy, id(i2s_speaker)->is_stopped());
+          if (want && !id(mww).is_running()) {
+            id(mww).start();
+          } else if (!want && id(mww).is_running()) {
+            id(mww).stop();
+          }
 
 binary_sensor:
   - platform: gpio
@@ -624,19 +610,32 @@ binary_sensor:
     # GPIO41 chatters — one physical press fired ~8 events; debounce to one.
     filters:
       - delayed_on_off: 20ms
-    # One button = toggle, like the classic Atom Echo: start a turn (with the
-    # wake beep) when idle, cancel the in-progress turn otherwise.
+    # One button = toggle, like the classic Atom Echo: cancel the turn in
+    # progress (including one whose wake beep is still playing), otherwise
+    # start one — or, with the backend down, blip the error cue instead of
+    # pretending to listen. The turn decision is va_core's button_action();
+    # HA media isn't handled from this button.
     on_click:
       min_length: 20ms
       max_length: 2000ms
       then:
         - if:
             condition:
-              lambda: 'return id(va_phase) == "idle";'
+              lambda: |-
+                return id(bus).turn_starting() ||
+                       id(va)->button_action(false, false) == va_client::ButtonAction::Cancel;
             then:
-              - script.execute: start_turn
-            else:
               - lambda: id(va)->send_interrupt();
               - script.execute:
                   id: play_cue
                   song: "cancel:d=16,o=5,b=200:g,e"
+            else:
+              - if:
+                  condition:
+                    lambda: 'return id(va)->button_action(false, false) == va_client::ButtonAction::NotConnected;'
+                  then:
+                    - script.execute:
+                        id: play_cue
+                        song: "error:d=8,o=4,b=120:c,c"
+                  else:
+                    - script.execute: start_turn
