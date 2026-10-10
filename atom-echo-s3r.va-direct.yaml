@@ -42,7 +42,8 @@ esphome:
       # "hiss floor" burying speech (likely the hiss the PGA cut above was
       # chasing). Measured on this unit: x2 → 7 of 10 starts corrupted, x1 →
       # 0 of 9. Espressif's own driver (esp_codec_dev es8311.c) maps 1→0,
-      # 2→1, 4→2, 8→3. Drop this once the component is fixed upstream.
+      # 2→1, 4→2, 8→3. Fixed upstream in esphome/esphome#20121 (first in
+      # 2026.10.0) — drop this once min_version is 2026.10.0 or later.
       - lambda: |-
           uint8_t reg = 0x02, val = 0;
           id(bus_a)->write_readv(0x18, &reg, 1, &val, 1);
