@@ -112,6 +112,11 @@ class VaCore {
     // Broke before the stability window elapsed — keep the failure counter
     // and the fired flag so a flapping link doesn't earn fresh chimes.
     this->stable_armed_ = false;
+    // A follow-up window can't work without the link: drop any latched or
+    // pending one so a draining reply goes straight to Idle and no ambient
+    // window opens (and streams) on a dead WS.
+    this->clear_follow_up_latch_();
+    this->cancel_followup_timers_();
     this->apply_server_phase_(Phase::Idle, now, audio_fill, out);
     this->schedule_reconnect_(now, out);
   }
@@ -217,26 +222,14 @@ class VaCore {
     if (this->no_speech_armed_ && time_reached_(now, this->no_speech_at_)) {
       this->no_speech_armed_ = false;
       if (this->state_ == State::Listening) {
-        // Raw interrupt send (original bypassed send_interrupt(): no flush,
-        // no interrupt_pending_) guarded on the WS being up.
-        if (this->connected_)
-          out.push_back({Action::Type::SendInterrupt, nullptr});
-        this->transition_(State::Idle, kPhaseIdle, now, out);
+        this->send_interrupt(now, out);
       }
     }
     // Max-listen watchdog: hard ceiling on time spent in Listening.
     if (this->listen_max_armed_ && time_reached_(now, this->listen_max_at_)) {
       this->listen_max_armed_ = false;
       if (this->state_ == State::Listening) {
-        // Full send_interrupt(): tells the bridge to abort the wedged turn.
-        // send_interrupt() latches interrupt_pending_ for a server idle to
-        // consume, but the local transition to Idle below makes that idle
-        // land with !turn_just_ended — nothing would ever consume it and the
-        // stale flag would eat the NEXT turn's follow-up window (review
-        // H2/E). Consume it here: the local Idle already closes the turn.
         this->send_interrupt(now, out);
-        this->interrupt_pending_ = false;
-        this->transition_(State::Idle, kPhaseIdle, now, out);
       }
     }
     // Silent follow-up echo-guard delay elapsed → open the ambient window.
@@ -292,21 +285,35 @@ class VaCore {
     this->arm_listening_watchdog_(now);
   }
 
-  // Stop / cancel: abort the current turn back to idle. No-op (bar a shell
-  // warn log) when the WS is down — matches the original early return.
+  // Stop / cancel / watchdog abort: end the current turn and go Idle NOW.
+  //
+  // The device is authoritative for its own abort — it does not wait for the
+  // server's answering phase=idle. That idle never comes when the bridge is
+  // already idle (a follow-up window: the bridge's setPhase dedupes), and
+  // waiting for it used to leave the mic streaming with every deadline
+  // disarmed. The interrupt is still sent (WS up) so the bridge cancels the
+  // in-flight response; its answering idle then lands on Idle as a spurious
+  // idle (LED sync only, nothing to consume). Works with the WS down too:
+  // the queued tail is flushed and the mic closed either way.
+  //
+  // Already Idle = no turn to abort: only drop a pending follow-up (a stop
+  // during the ambient echo guard), send nothing and emit nothing — callers
+  // (the Atom's stop word) rely on an idle interrupt being a no-op.
   void send_interrupt(uint32_t now, Actions &out) {
-    (void) now;
-    if (!this->connected_)
+    if (this->state_ == State::Idle) {
+      this->cancel_followup_timers_();
+      this->clear_follow_up_latch_();
       return;
-    out.push_back({Action::Type::SendInterrupt, nullptr});
+    }
+    if (this->connected_)
+      out.push_back({Action::Type::SendInterrupt, nullptr});
     out.push_back({Action::Type::FlushAudioQueue, nullptr});
-    this->clear_follow_up_latch_();
+    this->reset_turn_modifiers_();
     this->no_speech_armed_ = false;
-    this->cancel_followup_timers_();
     this->listen_max_armed_ = false;
-    // The phase=idle the server is about to send must not open a follow-up
-    // window — the user said "stop". Consumed on the next end-of-turn idle.
-    this->interrupt_pending_ = true;
+    this->cancel_followup_timers_();
+    this->followup_chime_pending_ = false;
+    this->transition_(State::Idle, kPhaseIdle, now, out);
   }
 
   // Barge-in prologue (wake word during a reply, before the wake chime):
@@ -365,7 +372,6 @@ class VaCore {
   bool connected() const { return this->connected_; }
   const char *current_phase() const { return this->current_phase_; }
   // Exposed for tests / diagnostics.
-  bool interrupt_pending() const { return this->interrupt_pending_; }
   uint32_t consecutive_failures() const { return this->consecutive_failures_; }
   uint32_t server_follow_up_ms() const { return this->server_follow_up_ms_; }
 
@@ -416,7 +422,6 @@ class VaCore {
   }
 
   void reset_turn_modifiers_() {
-    this->interrupt_pending_ = false;
     this->clear_follow_up_latch_();
     this->drain_t_fill_zero_ = 0;
   }
@@ -485,15 +490,6 @@ class VaCore {
       return;
     }
 
-    if (this->interrupt_pending_) {
-      // User barge-cancelled. Clean close, no drain wait (send_interrupt
-      // already flushed the ring), no follow-up.
-      this->interrupt_pending_ = false;
-      this->clear_follow_up_latch_();
-      this->transition_(State::Idle, kPhaseIdle, now, out);
-      return;
-    }
-
     // Real end of turn. If everything already played out, go straight to the
     // post-turn decision; otherwise park in WaitingDrain (deliberately with
     // NO phase emit — finish_drain_ fires the deferred LED-idle later) and
@@ -513,16 +509,6 @@ class VaCore {
     // Post-turn decision point once the PSRAM ring AND the downstream chain
     // have drained (or the timeout fallback hit): emit the deferred
     // LED-idle, then open a follow-up window or go straight to Idle.
-
-    // A stop / barge-in that landed while the reply was still draining set
-    // interrupt_pending_ after the phase=idle already consumed its chance —
-    // honor it here: the user cancelled, NEVER open a follow-up window.
-    if (this->interrupt_pending_) {
-      this->interrupt_pending_ = false;
-      this->clear_follow_up_latch_();
-      this->transition_(State::Idle, kPhaseIdle, now, out);
-      return;
-    }
 
     // Diagnostics hook — the shell logs per-turn latency/audio stats here.
     out.push_back({Action::Type::LogTurnStats, nullptr});
@@ -564,7 +550,6 @@ class VaCore {
   bool connected_{false};
   bool wake_sound_enabled_{true};
 
-  bool interrupt_pending_{false};
   uint32_t server_follow_up_ms_{0};
   bool server_follow_up_chime_{false};
   // True while FollowupArmed is waiting for yaml's chime → commit handoff

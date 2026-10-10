@@ -824,9 +824,10 @@ void VaClient::start_session() {
 
 void VaClient::send_interrupt() {
   if (!this->ws_connected_) {
-    ESP_LOGW(TAG, "send_interrupt: WS not connected");
-    // The core no-ops on its own connected_ guard; fall through so the two
-    // stay in sync even if the flags briefly diverge across the defer gap.
+    // The core still aborts locally (flush + Idle) and only skips the send
+    // on its own connected_ guard; fall through so the two stay in sync
+    // even if the flags briefly diverge across the defer gap.
+    ESP_LOGW(TAG, "send_interrupt: WS not connected — aborting locally only");
   }
   this->run_core_([now = millis()](VaCore &core, Actions &out) {
     core.send_interrupt(now, out);
