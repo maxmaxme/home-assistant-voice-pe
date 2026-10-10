@@ -34,7 +34,9 @@ as an **entity/announcement channel**: HA sees the device and its
 `Media Player` entity and can play announcements from scripts/automations
 (`tts.speak`, `media_player.play_media` with `announce: true`) through the
 announcement mixer input, concurrently with the assistant's voice. On the
-Voice PE this also exposes Mute, LED Ring, Restart;
+Voice PE this also exposes Mute, LED Ring, Restart and a hidden-by-default
+`Disable physical controls` switch (upstream's button lock: ignores the center
+button and the dial);
 on the Atom Echo the mixer + announcement/media chains were added for this
 (its shared-mutex I2S bus needs mww stop/start choreography around playback
 — see `on_announcement` / `on_play` / `on_idle` in its media_player; no

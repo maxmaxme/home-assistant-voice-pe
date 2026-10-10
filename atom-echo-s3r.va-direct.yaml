@@ -8,7 +8,7 @@ esphome:
   name: ${name}
   friendly_name: ${friendly_name}
   name_add_mac_suffix: true
-  min_version: 2026.6.0
+  min_version: 2026.9.0
   on_boot:
     priority: 375
     then:

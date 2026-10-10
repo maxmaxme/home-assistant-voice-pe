@@ -50,7 +50,7 @@ jobs:
           restore-keys: |
             pio-${{ runner.os }}-${{ matrix.file }}-
       - name: 🔧 Install esphome
-        run: pip install esphome==2026.6.4
+        run: pip install esphome==2026.9.1
       - name: 🔑 Stub secrets
         # va_device_token (Voice PE), va_device_token_atom (Atom Echo) and
         # ap_password (both configs' fallback AP) are the !secrets the

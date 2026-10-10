@@ -7,6 +7,11 @@ from esphome.const import CONF_ID, CONF_URL, CONF_TRIGGER_ID
 
 CODEOWNERS = ["@maxmaxme"]
 DEPENDENCIES = ["network", "microphone", "speaker"]
+# ArduinoJson (control-channel JSON) comes from ESPHome's own json component,
+# so it is pulled in exactly the way the current ESPHome expects (an IDF
+# registry component on esp32 since 2026.9 — a separate add_library() here
+# shadowed it and broke sendspin-cpp's dependency on it).
+AUTO_LOAD = ["json"]
 
 CONF_TOKEN = "token"
 CONF_MICROPHONE = "microphone"
@@ -84,11 +89,6 @@ async def to_code(config):
         name="espressif/esp_websocket_client",
         ref="1.7.0",
     )
-    # JSON parser for the control channel ({"type":"phase","value":"..."} etc.).
-    # ArduinoJson is header-only and ESPHome already uses it in several core
-    # components, so the build infra is well-trodden.
-    cg.add_library("ArduinoJson", "7.4.2")
-
     if config[CONF_DIAGNOSTICS]:
         cg.add_define("USE_VA_CLIENT_DIAGNOSTICS")
 
