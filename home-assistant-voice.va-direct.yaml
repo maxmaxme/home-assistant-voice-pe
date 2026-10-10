@@ -1635,7 +1635,22 @@ va_client:
         } else if (phase == "replying") {
           id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
         }
-    - script.execute: control_leds
+    # A stop's red flash owns the ring for its 800 ms and repaints via
+    # control_leds itself. The core emits `idle` the moment it aborts (and the
+    # bridge's answering idle follows), and both land here deferred, AFTER the
+    # stop handler started the flash — repainting now would cut it short. Any
+    # non-idle phase (a new wake right after the stop) ends the flash instead.
+    - if:
+        condition:
+          lambda: 'return phase != "idle";'
+        then:
+          - script.stop: stop_feedback_flash
+    - if:
+        condition:
+          not:
+            script.is_running: stop_feedback_flash
+        then:
+          - script.execute: control_leds
     # Arm the "stop" wake word while the assistant is speaking OR while a
     # follow-up window is behind the current listening phase (user changed
     # their mind — "отмени"/"stop"); disarm otherwise to prevent false

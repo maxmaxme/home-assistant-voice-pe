@@ -95,6 +95,13 @@ so the device never reboots on a missing API client.
 - **No-speech watchdog**: 7 s after entering `listening` with no audio
   flowing → tear the session down and return to `idle`. Cancelled once the
   server confirms speech.
+- **Aborts are local**: `send_interrupt()` (Stop word, center-button cancel,
+  both watchdogs) closes the turn on the device immediately — flush, mic off,
+  `idle` — and only *tells* the bridge. It never waits for the server's
+  answering `idle`: during a follow-up window the bridge is already idle and
+  dedupes it, so waiting used to leave the mic streaming forever. In plain
+  Idle it is a no-op (beyond dropping a pending follow-up window). A WS drop
+  also discards any latched/pending follow-up window.
 - **Max-listen watchdog** (`kMaxListeningMs`, 30 s): a hard ceiling re-armed
   on *every* entry to `listening` (wake, server-confirmed listening, follow-up).
   Backstops the case where the backend goes silent after confirming speech with
@@ -262,6 +269,16 @@ an imperative shell:
   `test_va_core.cpp` with a plain host toolchain (vendored ArduinoJson,
   no esp-idf) and runs it. Known bugs are pinned by characterization
   tests and marked `KNOWN BUG` in `va_core.h`.
+- **Invariant fuzzing**: the same script then runs `fuzz_va_core.cpp` —
+  seeded random sequences of wake/stop/barge-in, WS drops and server
+  messages in any order, checking after every step that (I1) the mic always
+  closes on its own if nothing else happens, (I2) the mic only streams while
+  the LED shows `listening`, (I3/I4) no sends on a dead WS / no reconnect
+  while up, (I5) no follow-up window after a stop. A failure prints the seed
+  and an event trace; `FUZZ_FIRST_SEED=<n> FUZZ_SEEDS=1 ./tests/host/run.sh`
+  reproduces it, `FUZZ_SEEDS`/`FUZZ_STEPS` scale a longer local run. New
+  core behaviour should come with a new invariant here, not just an example
+  test.
 - **CI**: `.github/workflows/build-va-direct.yml` runs the host tests
   and `esphome compile`s both va-direct yamls
   (`home-assistant-voice.va-direct.yaml`, `atom-echo-s3r.va-direct.yaml`)

@@ -280,30 +280,38 @@ TEST(interrupt_during_reply_closes_without_followup) {
   f.interrupt();
   CHECK_EQ(f.count(AT::SendInterrupt), 1);
   CHECK_EQ(f.count(AT::FlushAudioQueue), 1);
-  CHECK(f.core.interrupt_pending());
-
-  // Server acks with idle — consumed by the interrupt: clean close, no
-  // drain wait, no follow-up.
-  f.fill = 0;
-  f.phase("idle");
+  // Closed locally, right away — no waiting on the server.
   CHECK_EQ(f.core.state(), State::Idle);
   CHECK_EQ(f.phase_count("idle"), 1);
-  CHECK(!f.core.interrupt_pending());
+  // Reply frames still in flight are dropped, not re-queued as a blip.
+  CHECK(!f.core.accepts_reply_audio());
+
+  // Server acks with idle (plus a stale follow_up racing it): spurious idle,
+  // LED sync only — no drain wait, no follow-up.
+  f.fill = 0;
+  f.text("{\"type\":\"follow_up\",\"ms\":8000}");
+  f.phase("idle");
+  CHECK_EQ(f.core.state(), State::Idle);
+  f.run_for(VaCore::kFollowupOpenDelayMs + 100);
+  CHECK_EQ(f.core.state(), State::Idle);
+  CHECK(!f.core.is_mic_streaming());
   CHECK_EQ(f.count(AT::FireFollowupOpened), 0);
 }
 
-TEST(interrupt_landing_during_drain_is_honored_by_finish_drain) {
+TEST(interrupt_landing_during_drain_closes_without_followup) {
   Fixture f;
   f.connect();
   f.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000}");
   CHECK_EQ(f.core.state(), State::WaitingDrain);
+  f.clear();
 
   // Stop lands while the reply tail is still draining — past the phase=idle.
   f.interrupt();
-  f.clear();
+  CHECK_EQ(f.core.state(), State::Idle);
+  CHECK_EQ(f.count(AT::FlushAudioQueue), 1);
+  CHECK_EQ(f.phase_count("idle"), 1);
   f.play_out();
   CHECK_EQ(f.core.state(), State::Idle);
-  CHECK_EQ(f.phase_count("idle"), 1);
   // Interrupt path skips the diagnostics hook and never opens a follow-up.
   CHECK_EQ(f.count(AT::LogTurnStats), 0);
   CHECK_EQ(f.count(AT::FireFollowupOpened), 0);
@@ -311,14 +319,119 @@ TEST(interrupt_landing_during_drain_is_honored_by_finish_drain) {
   CHECK_EQ(f.core.state(), State::Idle);
 }
 
-TEST(interrupt_while_disconnected_is_a_noop) {
+TEST(interrupt_while_disconnected_closes_locally_without_send) {
   Fixture f;
-  f.wake();
+  f.wake();  // mic opens even with WS down
   f.clear();
   f.interrupt();
   CHECK_EQ(f.count(AT::SendInterrupt), 0);
-  CHECK_EQ(f.count(AT::FlushAudioQueue), 0);
-  CHECK(!f.core.interrupt_pending());
+  // Still flushes and closes — a stop must work even with the link down.
+  CHECK_EQ(f.count(AT::FlushAudioQueue), 1);
+  CHECK_EQ(f.core.state(), State::Idle);
+  CHECK(!f.core.is_mic_streaming());
+}
+
+// Regression: the bridge is already idle during a follow-up window, so it
+// never answers the interrupt with a phase=idle. The mic used to stay open
+// forever (every deadline disarmed) while the LED showed idle.
+TEST(interrupt_when_idle_is_a_noop) {
+  Fixture f;
+  f.connect();
+  f.clear();
+  f.interrupt();
+  CHECK_EQ(f.count(AT::SendInterrupt), 0);
+  CHECK_EQ(f.count(AT::EmitPhase), 0);
+  CHECK_EQ(f.core.state(), State::Idle);
+}
+
+TEST(interrupt_during_ambient_echo_guard_cancels_window) {
+  Fixture f;
+  f.connect();
+  f.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000}");
+  f.play_out();
+  CHECK_EQ(f.core.state(), State::Idle);  // parked for the echo guard
+  f.clear();
+  f.interrupt();
+  CHECK_EQ(f.count(AT::SendInterrupt), 0);
+  f.run_for(VaCore::kFollowupOpenDelayMs + 100);
+  CHECK_EQ(f.core.state(), State::Idle);
+  CHECK(!f.core.is_mic_streaming());
+}
+
+TEST(interrupt_in_ambient_followup_window_closes_mic) {
+  Fixture f;
+  f.connect();
+  f.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000}");
+  f.play_out();
+  f.run_for(VaCore::kFollowupOpenDelayMs + 10);
+  CHECK_EQ(f.core.state(), State::FollowupArmed);
+  CHECK(f.core.is_mic_streaming());
+  f.clear();
+
+  f.interrupt();  // no server reply follows
+  CHECK_EQ(f.count(AT::SendInterrupt), 1);
+  CHECK_EQ(f.core.state(), State::Idle);
+  CHECK(!f.core.is_mic_streaming());
+  CHECK_EQ(f.phase_count("idle"), 1);
+  f.run_for(60000);
+  CHECK_EQ(f.core.state(), State::Idle);
+}
+
+TEST(interrupt_in_committed_chimed_followup_closes_mic) {
+  Fixture f;
+  f.connect();
+  f.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000,\"chime\":true}");
+  f.play_out();
+  CHECK_EQ(f.core.state(), State::FollowupArmed);
+  f.commit();
+  CHECK_EQ(f.core.state(), State::Listening);
+  f.clear();
+
+  f.interrupt();
+  CHECK_EQ(f.core.state(), State::Idle);
+  CHECK(!f.core.is_mic_streaming());
+  f.run_for(60000);
+  CHECK_EQ(f.core.state(), State::Idle);
+}
+
+TEST(interrupt_during_chime_cancels_pending_commit) {
+  // Stop while yaml is still playing the follow-up chime: the late commit
+  // must not reopen the mic.
+  Fixture f;
+  f.connect();
+  f.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000,\"chime\":true}");
+  f.play_out();
+  CHECK_EQ(f.core.state(), State::FollowupArmed);
+  f.interrupt();
+  f.commit();
+  CHECK_EQ(f.core.state(), State::Idle);
+  CHECK(!f.core.is_mic_streaming());
+}
+
+TEST(disconnect_during_drain_never_opens_followup) {
+  Fixture f;
+  f.connect();
+  f.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000}");
+  f.disconnect();
+  f.clear();
+  f.play_out();
+  f.run_for(VaCore::kFollowupOpenDelayMs + 9000);
+  CHECK_EQ(f.count(AT::FireFollowupOpened), 0);
+  CHECK(!f.core.is_mic_streaming());
+  CHECK_EQ(f.phase_count("listening"), 0);
+}
+
+TEST(disconnect_during_followup_echo_guard_cancels_window) {
+  Fixture f;
+  f.connect();
+  f.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000}");
+  f.play_out();
+  CHECK_EQ(f.core.state(), State::Idle);  // parked for the echo guard
+  f.disconnect();
+  f.clear();
+  f.run_for(VaCore::kFollowupOpenDelayMs + 100);
+  CHECK_EQ(f.core.state(), State::Idle);
+  CHECK(!f.core.is_mic_streaming());
 }
 
 // ---- Watchdogs -----------------------------------------------------------------
@@ -334,9 +447,6 @@ TEST(no_speech_watchdog_aborts_silent_session) {
   CHECK_EQ(f.core.state(), State::Idle);
   CHECK_EQ(f.count(AT::SendInterrupt), 1);
   CHECK_EQ(f.phase_count("idle"), 1);
-  // Raw-send path: no flush, no pending interrupt.
-  CHECK_EQ(f.count(AT::FlushAudioQueue), 0);
-  CHECK(!f.core.interrupt_pending());
 }
 
 TEST(no_speech_watchdog_cancelled_by_server_confirm) {
@@ -376,22 +486,19 @@ TEST(max_listen_watchdog_aborts_wedged_turn) {
   CHECK_EQ(f.phase_count("idle"), 1);
 }
 
-TEST(max_listen_watchdog_consumes_interrupt_pending) {
-  // The watchdog transitions to Idle locally, so the server's answering
-  // phase=idle arrives with !turn_just_ended and can never consume the
-  // interrupt flag — the watchdog must not leave it latched, or it eats the
-  // follow-up window of the NEXT server-driven turn (review H2/E).
+TEST(abort_does_not_eat_next_turns_followup) {
+  // An abort (here the max-listen watchdog) must leave nothing latched that
+  // could swallow the follow-up window of the NEXT server-driven turn
+  // (review H2/E).
   Fixture f;
   f.connect();
   f.wake();
   f.phase("listening");
   f.run_for(VaCore::kMaxListeningMs + 10);
   CHECK_EQ(f.core.state(), State::Idle);
-  CHECK(!f.core.interrupt_pending());
 
-  // Server acks the interrupt with idle — spurious idle, nothing latched.
+  // Server acks the interrupt with idle — spurious idle.
   f.phase("idle");
-  CHECK(!f.core.interrupt_pending());
 
   // A subsequent server-driven turn: its follow-up window opens normally.
   f.phase("thinking");
