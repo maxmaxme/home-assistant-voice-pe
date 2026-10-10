@@ -38,8 +38,7 @@ Voice PE this also exposes Mute, LED Ring, Restart and a hidden-by-default
 `Disable physical controls` switch (upstream's button lock: ignores the center
 button and the dial);
 on the Atom Echo the mixer + announcement/media chains were added for this
-(its shared-mutex I2S bus needs mww stop/start choreography around playback
-— see `on_announcement` / `on_play` / `on_idle` in its media_player; no
+(its shared-mutex I2S bus is arbitrated by `bus_arbiter.h` — see below; no
 wake word while media plays). Both configs expose a `Wake word sensitivity`
 select (per-device probability cutoffs, `restore_value: true`) — the Atom's
 option set drops hey_mycroft, which it doesn't ship. Both configs declare a media_pipeline too, so
@@ -67,6 +66,7 @@ so the device never reboots on a missing API client.
 | File | Role |
 | --- | --- |
 | `__init__.py` | ESPHome codegen + YAML schema. Configurable: `url`, `token`, `microphone`, `mic_channel`, `mic_gain` (1–32, default 1 = no change; digital gain on the uplink), `input_format` (`stereo32` default = XMOS stereo-int32; `mono16` = plain int16-mono codec like ES8311), `speaker`, `on_phase` (automation), `on_followup_opened` (automation), `on_repeated_failure` (automation). |
+| `bus_arbiter.h` | **Shared-I2S-bus arbitration** for boards whose mic and speaker sit on one `i2s_audio` bus (the Atom). Pure and host-tested like `va_core.h`. Desired state, not edge triggers: yaml reports facts (`on_phase`, `begin_tone` / `finish_tone` for rtttl) and the `bus_reconcile` script (run every 100 ms and after each fact) turns `mic_wanted(media_busy, speaker_released)` into `micro_wake_word` start/stop — so a missed or duplicated callback heals on the next tick. Owns the tone follow-ups (`take_after_tone()` → open the session after the wake beep / commit the follow-up after its chime; a newer tone cancels them) and a tone timeout, so a tone whose finished callback never comes can't leave the mic off forever. Included from `va_client.h` only so the Atom yaml can hold one in `globals:`. Not used on the Voice PE (separate mic/speaker buses). |
 | `va_core.h` | **Functional core** (phase 1 split): the protocol state machine, all watchdog/deadline time math and server-JSON handling. Pure — no esp-idf / ESPHome / FreeRTOS includes, so it compiles and runs on the host (see Testing & CI below). Side effects only via an `Actions` list the shell executes. |
 | `va_client.h`, `va_client.cpp` | The **imperative shell**: WS transport (`esp_websocket_client`), mic/speaker audio plane, PSRAM ring, trigger firing. Marshals WS-task events onto the main loop via `defer()` — all text-frame handling runs on the main loop by design (the core is single-threaded). |
 | `automation.h` | `OnPhaseTrigger : Trigger<std::string>` (fires on every phase transition with the new phase name), `OnFollowupOpenedTrigger : Trigger<>` (fires when a **chimed** follow-up window opens — yaml owns the chime + echo-decay gate, then calls `commit_followup_mic()`), and `OnRepeatedFailureTrigger : Trigger<>` (fires when the failure counter trips). |
@@ -301,6 +301,11 @@ an imperative shell:
   `test_va_core.cpp` with a plain host toolchain (vendored ArduinoJson,
   no esp-idf) and runs it. Known bugs are pinned by characterization
   tests and marked `KNOWN BUG` in `va_core.h`.
+- **Bus arbitration** (`test_bus_arbiter.cpp`, also run by the same script):
+  example tests plus a seeded random run modelling the Atom yaml (phases,
+  tones whose callback may be lost, HA media, the speaker leaf's idle
+  timeout, the 100 ms reconcile) checking B1 never deaf, B2 no bus
+  contention, B3 a wake beep opens at most one session.
 - **Invariant fuzzing**: the same script then runs `fuzz_va_core.cpp` —
   seeded random sequences of wake/stop/barge-in, WS drops and server
   messages in any order, checking after every step that (I1) the mic always

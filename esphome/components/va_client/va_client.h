@@ -36,6 +36,9 @@
 #include "esphome/components/speaker/speaker.h"
 
 #include "va_core.h"
+// Not used by VaClient itself: pulled in here so a shared-bus config (the
+// Atom) can hold a BusArbiter in a yaml `globals:` entry.
+#include "bus_arbiter.h"
 
 #include <cstdint>
 #include <string>
