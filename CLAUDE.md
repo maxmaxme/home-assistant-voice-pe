@@ -167,11 +167,17 @@ sides in lockstep when changing it.
   The yaml asks in back-to-back nested `if`s (nothing runs between them, so
   it is one decision) and keeps only chimes, delays and speaker stops. Both
   are fuzzed through these calls (I7–I9).
-- `on_phase:` maps the phase string to the global
-  `voice_assistant_phase` so the original `control_leds` script can
-  drive the LED ring without modification. The original script came
-  from upstream; we just keep feeding it. It arms/disarms the `stop` model
-  from `stop_word_armed()` on every phase change.
+- `on_phase:` sets the global `voice_assistant_phase` from the core's
+  `led_phase()` (Idle / **Waiting** — wake fired, no speech heard yet /
+  Listening / Thinking / Replying) so the upstream `control_leds` script can
+  drive the ring unmodified. That is the **only** writer besides boot — yaml
+  no longer writes the phase after its own actions (those copies raced the
+  deferred `on_phase`; the wake path's "waiting for command" got overwritten
+  a loop later and never showed). It also arms/disarms the `stop` model from
+  `stop_word_armed()` on every phase change. Fuzzed as I10: the ring's
+  listening state matches the mic, and every `led_phase()` change comes with
+  a phase emit (the one exception is `prepare_barge_in()`, which pins Idle
+  silently for the chime).
 - **Volume (VPE)**: the media_player's volume and mute already reach the
   assistant's voice — they go down the speaker chains to the shared i2s leaf,
   i.e. the AIC3204's hardware volume / mute, which va_client's lane plays

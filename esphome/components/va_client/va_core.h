@@ -71,6 +71,16 @@ enum class WakeAction : uint8_t {
   NotConnected,  // wake word with the backend down → error chime, no session
 };
 
+// What the LED ring should show for the assistant, straight from the core's
+// state (yaml used to keep its own copy and overwrite it after its actions).
+enum class LedPhase : uint8_t {
+  Idle,
+  Waiting,    // wake fired, the mic is open, no speech heard yet
+  Listening,  // the server heard speech — or a follow-up window is open
+  Thinking,
+  Replying,   // incl. the reply tail still playing out after the server's idle
+};
+
 // What a single press of the center button should do. Inputs the core can't
 // see (the HA media player) are passed in by yaml.
 enum class ButtonAction : uint8_t {
@@ -443,6 +453,25 @@ class VaCore {
     return this->connected_ ? ButtonAction::Start : ButtonAction::NotConnected;
   }
 
+  // The ring's assistant phase. Waiting vs Listening is the no-speech
+  // watchdog: armed exactly from a wake until the server confirms speech.
+  LedPhase led_phase() const {
+    switch (this->state_) {
+      case State::Listening:
+        return this->no_speech_armed_ ? LedPhase::Waiting : LedPhase::Listening;
+      case State::FollowupArmed:
+        return this->followup_chime_pending_ ? LedPhase::Idle : LedPhase::Listening;
+      case State::Thinking:
+        return LedPhase::Thinking;
+      case State::Replying:
+      case State::WaitingDrain:
+        return LedPhase::Replying;
+      case State::Idle:
+      default:
+        return LedPhase::Idle;
+    }
+  }
+
   // The chimed follow-up handoff is still waiting for yaml's commit (nothing
   // pre-empted the window while the chime played).
   bool followup_commit_pending() const {
@@ -620,6 +649,14 @@ class VaCore {
     // let on_tick drive finish_drain_ when the speaker chain empties.
     this->state_ = State::WaitingDrain;
     this->state_entered_ms_ = now;
+    // From Thinking (reply audio raced ahead of its `replying`, then the turn
+    // ended): the tail now playing is a reply — say so, or the ring keeps
+    // showing "thinking" over the audio and the stop word stays disarmed.
+    // From Replying the label is already right and stays (no extra emit).
+    if (from == State::Thinking && audio_fill > 0) {
+      this->current_phase_ = kPhaseReplying;
+      out.push_back({Action::Type::EmitPhase, kPhaseReplying});
+    }
     // Fresh drain clock per turn: a follow-up turn reaches here without
     // start_session(), so the previous turn's fill-zero timestamp would make
     // the 3 s fallback fire instantly (review H2/B).

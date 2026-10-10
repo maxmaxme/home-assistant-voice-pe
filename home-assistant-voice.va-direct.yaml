@@ -341,8 +341,6 @@ binary_sensor:
                             - lambda: id(va)->send_interrupt();
                             - speaker.stop:
                                 id: media_resampling_speaker
-                            - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
-                            - script.execute: control_leds
                           else:
                             - if:
                                 condition:
@@ -379,8 +377,6 @@ binary_sensor:
                                                   timeout: 2s
                                               - delay: 600ms
                                               - lambda: id(va)->start_session();
-                                              - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
-                                              - script.execute: control_leds
       # Double Click
       #  . Exposed as an event entity. To be used in automations inside Home Assistant
       - timing:
@@ -1588,15 +1584,28 @@ va_client:
   # unused (no music pipeline configured), so it's effectively ours.
   speaker: media_resampling_speaker
   on_phase:
+    # The ring's assistant phase is the core's led_phase(), the single source:
+    # yaml doesn't write voice_assistant_phase after its own actions any more
+    # (those copies raced this deferred handler — the wake path's "waiting
+    # for command" was overwritten one loop later and never actually showed).
+    # Read live, so a stale deferred emit can't paint an old phase.
     - lambda: |-
-        if (phase == "idle") {
-          id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
-        } else if (phase == "listening") {
-          id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
-        } else if (phase == "thinking") {
-          id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
-        } else if (phase == "replying") {
-          id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+        switch (id(va)->led_phase()) {
+          case va_client::LedPhase::Idle:
+            id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+            break;
+          case va_client::LedPhase::Waiting:
+            id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+            break;
+          case va_client::LedPhase::Listening:
+            id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
+            break;
+          case va_client::LedPhase::Thinking:
+            id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
+            break;
+          case va_client::LedPhase::Replying:
+            id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+            break;
         }
     # A stop's red flash owns the ring for its 800 ms and repaints via
     # control_leds itself. The core emits `idle` the moment it aborts (and the
@@ -1605,7 +1614,7 @@ va_client:
     # non-idle phase (a new wake right after the stop) ends the flash instead.
     - if:
         condition:
-          lambda: 'return phase != "idle";'
+          lambda: 'return id(va)->led_phase() != va_client::LedPhase::Idle;'
         then:
           - script.stop: stop_feedback_flash
     - if:
@@ -1681,8 +1690,6 @@ va_client:
           lambda: 'return id(va)->followup_commit_pending();'
         then:
           - lambda: id(va)->commit_followup_mic();
-          - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
-          - script.execute: control_leds
 
 audio_dac:
   - platform: aic3204
@@ -1728,9 +1735,9 @@ micro_wake_word:
                 - lambda: id(va)->send_interrupt();
                 - speaker.stop:
                     id: media_resampling_speaker
-                - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
                 # Red-ring feedback that the stop registered, then repaint to
-                # idle (stop_feedback_flash ends in control_leds after 800 ms).
+                # idle (stop_feedback_flash ends in control_leds after 800 ms;
+                # the core's idle reaches voice_assistant_phase via on_phase).
                 - script.execute: stop_feedback_flash
                 - micro_wake_word.disable_model: stop
               else:
@@ -1782,8 +1789,6 @@ micro_wake_word:
                       # into "cancel the in-flight reply + go to listening" —
                       # this single call both barges in and reopens the mic.
                       - lambda: id(va)->start_session();
-                      - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
-                      - script.execute: control_leds
                     else:
                       - if:
                           condition:
@@ -1836,13 +1841,9 @@ micro_wake_word:
                                         # still draining. 400 ms covers the typical
                                         # tail (XMOS AEC catches the residual).
                                         - delay: 400ms
+                                  # The ring follows via on_phase: "waiting for command"
+                                  # until the server hears speech, then "listening".
                                   - lambda: id(va)->start_session();
-                                  # Show "waiting for command" (blue spin) immediately on wake,
-                                  # before the server VAD detects actual speech. va_client's
-                                  # on_phase will overwrite to phase 3 (listening_for_command)
-                                  # once the server reports speech started.
-                                  - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
-                                  - script.execute: control_leds
 
 select:
   - platform: template
