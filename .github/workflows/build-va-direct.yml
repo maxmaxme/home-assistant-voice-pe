@@ -14,6 +14,13 @@ concurrency:
   group: va-direct-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  # Single source for the pinned ESPHome version: the install step and the
+  # ESP-IDF cache key both read it, so a bump invalidates the toolchain cache.
+  ESPHOME_VERSION: "2026.9.1"
+  # Bound the compiler cache; one config's full build is ~2k objects.
+  CCACHE_MAXSIZE: 500M
+
 jobs:
   host-tests:
     name: 🧪 va_core host tests
@@ -37,20 +44,43 @@ jobs:
       - name: ⤵️ Check out configuration from GitHub
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
       - name: 🐍 Set up Python
+        id: python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
-      - name: 📦 Cache PlatformIO + esphome build deps
+          cache: pip
+          cache-dependency-path: .github/workflows/build-va-direct.yml
+      # ESPHome 2026.x builds natively with ESP-IDF (no PlatformIO): the
+      # framework, toolchains and its Python env live in ~/.cache/esphome/idf
+      # (~1 min to download + install). It depends only on the ESPHome
+      # version (and the Python its venv was built against), so one entry
+      # serves both matrix jobs.
+      - name: 📦 Cache ESP-IDF toolchain
         uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809  # v4.2.4
         with:
           path: |
-            ~/.platformio
-            ~/.espressif
-          key: pio-${{ runner.os }}-${{ matrix.file }}-${{ hashFiles('home-assistant-voice.va-direct.yaml', 'atom-echo-s3r.va-direct.yaml') }}
+            ~/.cache/esphome/idf
+            !~/.cache/esphome/idf/ccache
+          key: esp-idf-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-esphome-${{ env.ESPHOME_VERSION }}
+      # Compiling ~1900 objects is most of the job (~4.5 min). ESPHome wraps
+      # the compiler in ccache automatically when it's on PATH and keeps the
+      # cache under ~/.cache/esphome/idf/ccache. Restore the newest entry for
+      # this config; save a fresh one only from dev/main pushes (and manual
+      # runs) so PRs reuse dev's cache without each PR run piling up
+      # entries against the repo's 10 GB cache quota.
+      - name: 🧰 Install ccache
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ccache
+      - name: 📦 Restore ccache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809  # v4.2.4
+        with:
+          path: ~/.cache/esphome/idf/ccache
+          key: ccache-${{ runner.os }}-${{ matrix.file }}-${{ github.run_id }}
           restore-keys: |
-            pio-${{ runner.os }}-${{ matrix.file }}-
+            ccache-${{ runner.os }}-${{ matrix.file }}-
       - name: 🔧 Install esphome
-        run: pip install esphome==2026.9.1
+        run: pip install esphome==${{ env.ESPHOME_VERSION }}
       - name: 🔑 Stub secrets
         # va_device_token (Voice PE), va_device_token_atom (Atom Echo) and
         # ap_password (both configs' fallback AP) are the !secrets the
@@ -62,3 +92,12 @@ jobs:
           echo 'ap_password: "ci-build-stub"' >> secrets.yaml
       - name: 🔨 Compile
         run: esphome compile ${{ matrix.file }}
+      - name: 📊 ccache stats
+        if: always()
+        run: ccache --dir ~/.cache/esphome/idf/ccache --show-stats || true
+      - name: 💾 Save ccache
+        if: success() && github.event_name != 'pull_request'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809  # v4.2.4
+        with:
+          path: ~/.cache/esphome/idf/ccache
+          key: ccache-${{ runner.os }}-${{ matrix.file }}-${{ github.run_id }}
