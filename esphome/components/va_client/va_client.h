@@ -144,6 +144,7 @@ class VaClient : public Component {
     return this->core_.button_action(announcing, media_playing);
   }
   bool stop_word_armed() const { return this->core_.stop_word_armed(); }
+  LedPhase led_phase() const { return this->core_.led_phase(); }
   bool followup_commit_pending() const { return this->core_.followup_commit_pending(); }
   // Master mic mute switched on: end a listening window instead of streaming
   // zeros until a watchdog fires. Leaves a reply alone.

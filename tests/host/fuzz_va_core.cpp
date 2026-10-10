@@ -24,6 +24,11 @@
 //   I8  a center-button press during a turn always cancels it (never pauses
 //       HA media under a still-talking assistant).
 //   I9  muting the mic closes any listening window.
+//   I10 the LED ring tells the truth: led_phase() is Waiting/Listening exactly
+//       while the mic streams, and every change of it comes with a phase emit
+//       (yaml repaints only on on_phase — a silent change would leave the ring
+//       stale). Sole exception: prepare_barge_in(), which by design pins Idle
+//       silently for the chime and is always followed by start_session().
 //
 // Besides the raw API, events are routed the way the yaml routes them —
 // through wake_action() / button_action() — so the decisions are fuzzed too.
@@ -45,6 +50,7 @@ using esphome::va_client::Actions;
 using esphome::va_client::VaCore;
 using AT = Action::Type;
 using esphome::va_client::ButtonAction;
+using esphome::va_client::LedPhase;
 using esphome::va_client::WakeAction;
 
 namespace {
@@ -76,6 +82,11 @@ struct Sim {
   // I5 bookkeeping.
   bool cancelled = false;
 
+  // I10 bookkeeping.
+  LedPhase last_led = LedPhase::Idle;
+  bool emitted = false;
+  bool silent_led_ok = false;
+
   // I6 model: the device's turn ids as an outside observer sees them.
   uint32_t model_turn = 0;  // 0 = no start yet
   bool model_closed = false;
@@ -104,6 +115,8 @@ struct Sim {
   // Execute the actions the core emitted, the way the shell would.
   void drain_actions() {
     for (const auto &a : this->out) {
+      if (a.type == AT::EmitPhase)
+        this->emitted = true;
       switch (a.type) {
         case AT::SendStart:
         case AT::SendInterrupt:
@@ -196,6 +209,7 @@ struct Sim {
       return;
     this->fill = 0;  // yaml flushes the ring + stops the resampler
     this->core.prepare_barge_in();
+    this->silent_led_ok = true;
     this->wake_pending = true;
     this->wake_at = this->now + 400 + this->rand(600);
     this->log(label);
@@ -423,7 +437,20 @@ struct Sim {
       this->fail("I1: mic still streaming after quiescence");
   }
 
+  void check_led() {
+    const LedPhase led = this->core.led_phase();
+    const bool mic_led = led == LedPhase::Waiting || led == LedPhase::Listening;
+    if (mic_led != this->core.is_mic_streaming())
+      this->fail("I10: the ring's listening state disagrees with the mic");
+    if (led != this->last_led && !this->emitted && !this->silent_led_ok)
+      this->fail("I10: led_phase changed without a phase emit (stale ring)");
+    this->last_led = led;
+    this->emitted = false;
+    this->silent_led_ok = false;
+  }
+
   void check_invariants() {
+    this->check_led();
     if (this->core.is_mic_streaming() && std::strcmp(this->core.current_phase(), "listening") != 0)
       this->fail("I2: mic streaming while LED does not show listening");
     if (this->core.stop_word_armed()) {
@@ -461,6 +488,6 @@ int main() {
       }
     }
   }
-  std::printf("PASS fuzz: %u seeds x %u steps, invariants I1-I9 held\n", seeds, steps);
+  std::printf("PASS fuzz: %u seeds x %u steps, invariants I1-I10 held\n", seeds, steps);
   return 0;
 }

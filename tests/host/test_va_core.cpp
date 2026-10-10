@@ -16,6 +16,7 @@ using esphome::va_client::VaCore;
 using State = VaCore::State;
 using AT = Action::Type;
 using esphome::va_client::ButtonAction;
+using esphome::va_client::LedPhase;
 using esphome::va_client::WakeAction;
 
 namespace {
@@ -1227,6 +1228,71 @@ TEST(mic_mute_ends_a_listening_window_but_not_a_reply) {
   g.core.on_mic_muted(g.now, g.log);
   CHECK_EQ(g.core.state(), State::Idle);
   CHECK(!g.core.is_mic_streaming());
+}
+
+// ---- LED phase ---------------------------------------------------------------------
+
+TEST(led_phase_waits_until_the_server_hears_speech) {
+  Fixture f;
+  f.connect();
+  CHECK(f.core.led_phase() == LedPhase::Idle);
+  f.wake();
+  CHECK(f.core.led_phase() == LedPhase::Waiting);  // mic open, nothing heard yet
+  f.phase("listening");
+  CHECK(f.core.led_phase() == LedPhase::Listening);
+  f.phase("thinking");
+  CHECK(f.core.led_phase() == LedPhase::Thinking);
+  f.phase("replying");
+  CHECK(f.core.led_phase() == LedPhase::Replying);
+  f.fill = 4096;
+  f.drained = false;
+  f.phase("idle");
+  CHECK_EQ(f.core.state(), State::WaitingDrain);
+  CHECK(f.core.led_phase() == LedPhase::Replying);  // tail still playing
+  f.play_out();
+  CHECK(f.core.led_phase() == LedPhase::Idle);
+}
+
+TEST(led_phase_follows_the_followup_windows) {
+  Fixture f;
+  f.connect();
+  f.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000}");
+  f.play_out();
+  f.run_for(VaCore::kFollowupOpenDelayMs + 10);
+  CHECK(f.core.led_phase() == LedPhase::Listening);  // ambient window, mic open
+
+  Fixture g;
+  g.connect();
+  g.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000,\"chime\":true}");
+  g.play_out();
+  CHECK(g.core.led_phase() == LedPhase::Idle);  // chime playing, mic closed
+  g.commit();
+  CHECK(g.core.led_phase() == LedPhase::Listening);
+}
+
+TEST(led_phase_returns_to_idle_on_the_no_speech_watchdog) {
+  Fixture f;
+  f.connect();
+  f.wake();
+  f.tick(VaCore::kNoSpeechTimeoutMs);
+  CHECK(f.core.led_phase() == LedPhase::Idle);
+}
+
+TEST(a_reply_tail_after_thinking_shows_as_replying) {
+  // Audio raced ahead of `replying`, then the server ended the turn: the tail
+  // that plays out is a reply — the ring and the stop word must say so.
+  Fixture f;
+  f.connect();
+  f.wake();
+  f.phase("thinking");
+  f.fill = 4096;
+  f.drained = false;
+  f.clear();
+  f.phase("idle");
+  CHECK_EQ(f.core.state(), State::WaitingDrain);
+  CHECK(f.core.led_phase() == LedPhase::Replying);
+  CHECK_EQ(f.phase_count("replying"), 1);
+  CHECK(f.core.stop_word_armed());
 }
 
 int main() { return run_all_tests(); }
