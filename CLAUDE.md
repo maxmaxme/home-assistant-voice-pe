@@ -59,7 +59,9 @@ so the device never reboots on a missing API client.
 | `atom-echo-s3r.va-direct.yaml` | Thin-client config for the **M5Stack Atom Echo S3R** (ESP32-S3-PICO, ES8311 mono codec, no XMOS). Reuses `va_client` with `input_format: mono16`; single full-duplex 16 kHz I2S bus + resampler. No LED ring/timers/Improv. `on_boot` rewrites ES8311 reg 0x02 to a ×1 clock pre-multiplier: the esphome es8311 component writes its table's literal multiplier as the register code (1 → ×2), and the doubled codec clock corrupted the ADC on about half of all mic starts. See `docs/superpowers/specs/2026-06-29-atom-echo-s3r-firmware-design.md`. |
 | `atom-echo-s3r.mic-diag.yaml` | Diagnostics wrapper for the Atom (`packages:` + `!extend` over the va-direct config, same device): logs per-0.5 s mic-stream stats (outliers, DC, RMS, peak) under `micdiag`, restarts the mic every 6 s and dumps ES8311 registers. Flash it to measure mic starts without talking; flash the va-direct config to go back. Not built in CI. |
 | `voice-kit.yaml` | XMOS voice-kit component. Shared between configs. |
-| `secrets.yaml` | **Gitignored.** Holds `va_url` (e.g. `ws://va.local:3001/voice`), `va_device_token` (the Voice PE's own bearer) and `va_device_token_atom` (the Atom Echo's own bearer) — each must be registered as a `voice` device for some user in the backend (see below). |
+| `secrets.yaml` | **Gitignored.** Holds `va_device_token` (the Voice PE's own bearer), `va_device_token_atom` (the Atom Echo's own bearer) — each must be registered as a `voice` device for some user in the backend — and `ap_password` (see Secrets below). The backend URL is the `va_url` **substitution** at the top of each va-direct yaml, not a secret. |
+| `flash-all.sh` | OTA-flashes both va-direct configs in parallel (`esphome run … --no-logs`). |
+| `sounds/` | The UI sounds (wake / mute / button / error chimes), byte-identical to upstream `dev`'s and refreshed by upstream syncs. The VPE yaml points at these local files so a compile needs no network for them. |
 
 ## Custom component: `esphome/components/va_client/`
 
@@ -69,7 +71,13 @@ so the device never reboots on a missing API client.
 | `bus_arbiter.h` | **Shared-I2S-bus arbitration** for boards whose mic and speaker sit on one `i2s_audio` bus (the Atom). Pure and host-tested like `va_core.h`. Desired state, not edge triggers: yaml reports facts (`on_phase`, `begin_tone` / `finish_tone` for rtttl) and the `bus_reconcile` script (run every 100 ms and after each fact) turns `mic_wanted(media_busy, speaker_released)` into `micro_wake_word` start/stop — so a missed or duplicated callback heals on the next tick. Owns the tone follow-ups (`take_after_tone()` → open the session after the wake beep / commit the follow-up after its chime; a newer tone cancels them) and a tone timeout, so a tone whose finished callback never comes can't leave the mic off forever. Included from `va_client.h` only so the Atom yaml can hold one in `globals:`. Not used on the Voice PE (separate mic/speaker buses). |
 | `va_core.h` | **Functional core** (phase 1 split): the protocol state machine, all watchdog/deadline time math and server-JSON handling. Pure — no esp-idf / ESPHome / FreeRTOS includes, so it compiles and runs on the host (see Testing & CI below). Side effects only via an `Actions` list the shell executes. |
 | `va_client.h`, `va_client.cpp` | The **imperative shell**: WS transport (`esp_websocket_client`), mic/speaker audio plane, PSRAM ring, trigger firing. Marshals WS-task events onto the main loop via `defer()` — all text-frame handling runs on the main loop by design (the core is single-threaded). |
-| `automation.h` | `OnPhaseTrigger : Trigger<std::string>` (fires on every phase transition with the new phase name), `OnFollowupOpenedTrigger : Trigger<>` (fires when a **chimed** follow-up window opens — yaml owns the chime + echo-decay gate, then calls `commit_followup_mic()`), and `OnRepeatedFailureTrigger : Trigger<>` (fires when the failure counter trips). |
+
+The trigger classes live in `va_client.h` (there is no `automation.h` any
+more): `OnPhaseTrigger : Trigger<std::string>` (fires on every phase
+transition with the new phase name), `OnFollowupOpenedTrigger : Trigger<>`
+(fires when a **chimed** follow-up window opens — yaml owns the chime +
+echo-decay gate, then calls `commit_followup_mic()`), and
+`OnRepeatedFailureTrigger : Trigger<>` (fires when the failure counter trips).
 
 ### What `va_client.cpp` does
 
@@ -217,7 +225,6 @@ a fresh custom path through `va_client`, not un-stubbing the old code.
 
 `secrets.yaml` is gitignored. Required keys:
 
-- `va_url` — backend WebSocket URL, e.g. `ws://va.local:3001/voice`.
 - `va_device_token` — the Voice PE's own bearer token (used by
   `home-assistant-voice.va-direct.yaml`). The backend authenticates it
   **per device against the DB**, not a shared env value: on the WS handshake
@@ -234,7 +241,11 @@ a fresh custom path through `va_client`, not un-stubbing the old code.
 - `ap_password` — shared password for both configs' fallback AP
   (`"Voice PE Setup"` / `"${friendly_name} Setup"`), used together with
   `captive_portal:` to reconfigure Wi-Fi without a full reflash.
-- All upstream secrets (WiFi creds, etc.) stay as in stock.
+
+Not secrets: the backend URL is each config's `va_url` substitution (e.g.
+`ws://va.local:3001/voice`), and **Wi-Fi credentials aren't in any file** —
+both configs provision Wi-Fi at runtime (Improv over BLE/serial on the Voice
+PE; the fallback AP + captive portal on both) and keep them in NVS.
 
 **Whenever a va-direct yaml starts referencing a new `!secret` key**, add it
 to the CI stub too (`.github/workflows/build-va-direct.yml`, the "🔑 Stub
@@ -282,15 +293,20 @@ consumes them once the reply has played out.
 
 ## Building / flashing
 
-Stock ESPHome workflow against `home-assistant-voice.va-direct.yaml`:
+Stock ESPHome workflow, OTA. `name_add_mac_suffix` gives each unit a
+fixed `<name>-<mac6>` hostname advertised over mDNS (`dns-sd -B
+_esphomelib._tcp local` lists them); target one explicitly:
 
 ```bash
-esphome run home-assistant-voice.va-direct.yaml
+esphome run home-assistant-voice.va-direct.yaml --no-logs --device home-assistant-voice-<mac6>.local
+esphome run atom-echo-s3r.va-direct.yaml        --no-logs --device atom-echo-s3r-<mac6>.local
 ```
 
-The custom component under `esphome/components/va_client/` is picked
-up automatically because the yaml `external_components:` block points
-at it.
+or `./flash-all.sh` for both in parallel. The custom components under
+`esphome/components/` are picked up automatically because each yaml's
+`external_components:` block points at them. `esphome logs` over the API
+needs the API encryption key, which HA set and the yaml doesn't carry — read
+device logs from the `udp_log` sink instead.
 
 ## Testing & CI
 
@@ -305,8 +321,7 @@ an imperative shell:
   handling runs on the main loop by design**.
 - **Host tests** live in `tests/host/` — `./tests/host/run.sh` compiles
   `test_va_core.cpp` with a plain host toolchain (vendored ArduinoJson,
-  no esp-idf) and runs it. Known bugs are pinned by characterization
-  tests and marked `KNOWN BUG` in `va_core.h`.
+  no esp-idf) and runs it.
 - **Bus arbitration** (`test_bus_arbiter.cpp`, also run by the same script):
   example tests plus a seeded random run modelling the Atom yaml (phases,
   tones whose callback may be lost, HA media, the speaker leaf's idle
@@ -318,7 +333,13 @@ an imperative shell:
   closes on its own if nothing else happens, (I2) the mic only streams while
   the LED shows `listening`, (I3/I4) no sends on a dead WS / no reconnect
   while up, (I5) no follow-up window after a stop, (I6) a message tagged with
-  a closed or older turn changes nothing. A failure prints the seed
+  a closed or older turn changes nothing, (I7) `stop` is armed only with
+  something to stop, (I8) a button press during a turn cancels it, (I9) mic
+  mute closes any listening window, (I10) the ring's listening state matches
+  the mic and every `led_phase()` change comes with a phase emit. Besides the
+  raw API, events are routed through the yaml-facing policy calls
+  (`wake_action()` / `button_action()`), so the decisions are fuzzed too.
+  A failure prints the seed
   and an event trace; `FUZZ_FIRST_SEED=<n> FUZZ_SEEDS=1 ./tests/host/run.sh`
   reproduces it, `FUZZ_SEEDS`/`FUZZ_STEPS` scale a longer local run. New
   core behaviour should come with a new invariant here, not just an example
@@ -326,7 +347,10 @@ an imperative shell:
 - **CI**: `.github/workflows/build-va-direct.yml` runs the host tests
   and `esphome compile`s both va-direct yamls
   (`home-assistant-voice.va-direct.yaml`, `atom-echo-s3r.va-direct.yaml`)
-  with a stubbed `secrets.yaml`. The upstream `build.yml` only covers
+  with a stubbed `secrets.yaml`. Its build cache carries ccache plus
+  `.esphome/` (wake-word models, XMOS firmware, external_components), so a
+  GitHub raw/release outage degrades to a warning instead of a failed build.
+  The upstream `build.yml` only covers
   the stock factory/8mb variants, so this workflow is what actually
   gates the fork's own configs.
 
