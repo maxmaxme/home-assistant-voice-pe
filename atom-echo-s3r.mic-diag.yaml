@@ -1,0 +1,95 @@
+# Mic-stream diagnostics for the Atom Echo S3R — NOT the production config.
+# Wraps the real va-direct config (same device name → OTA replaces it on the
+# same unit) and adds:
+#   - per-0.5 s stats on the raw mic stream: isolated outliers (a sample that
+#     jumps >1000 off two neighbours that agree within 500 — the signature of
+#     the ES8311 clock-multiplier corruption, see on_boot in the base config),
+#     samples in the ~-2400 band that corruption also produced, DC, RMS, peak
+#     and the driver's chunk sizes;
+#   - a silent mic restart every 6 s (wake-word stop/start → I2S RX restart),
+#     so good/bad starts can be counted without anyone talking;
+#   - a one-time ES8311 register dump 20 s after boot.
+# Everything is logged under the `micdiag` tag and reaches the host's device
+# log collector via udp_log. A clean start reads outliers=0 in quiet; the
+# multiplier bug showed 10–300 per window on about half of all starts.
+#
+#   esphome run atom-echo-s3r.mic-diag.yaml      # flash the diagnostics
+#   esphome run atom-echo-s3r.va-direct.yaml     # back to production
+
+packages:
+  base: !include atom-echo-s3r.va-direct.yaml
+
+globals:
+  - id: diag_cycle
+    type: int
+    initial_value: '0'
+
+microphone:
+  - id: !extend echo_mic
+    on_data:
+      - lambda: |-
+          // Per 0.5 s window: isolated outliers (a sample that jumps >1000 off
+          // the mean of two neighbours that agree within 500), split by sign,
+          // with their min/max and the first few values; plus chunk sizes the
+          // driver hands us (odd sizes would desync int16 framing).
+          static uint32_t n = 0, outl = 0, neg = 0, band = 0, chunks = 0, odd = 0;
+          static uint32_t cmin = 1u << 30, cmax = 0;
+          static int omin = 0, omax = 0;
+          static int16_t ex[4];
+          static int64_t sum = 0, sq = 0;
+          static int peak = 0;
+          static int16_t p2 = 0, p1 = 0;
+          chunks++;
+          if (x.size() & 1) odd++;
+          if (x.size() < cmin) cmin = x.size();
+          if (x.size() > cmax) cmax = x.size();
+          const int16_t *s = reinterpret_cast<const int16_t *>(x.data());
+          const size_t cnt = x.size() / 2;
+          for (size_t i = 0; i < cnt; i++) {
+            const int16_t c = s[i];
+            const int nb = ((int) p2 + (int) c) / 2;
+            if (abs((int) p1 - nb) > 1000 && abs((int) p2 - (int) c) < 500) {
+              if (outl < 4) ex[outl] = p1;
+              if (outl == 0 || p1 < omin) omin = p1;
+              if (outl == 0 || p1 > omax) omax = p1;
+              outl++;
+              if (p1 < 0) neg++;
+            }
+            if (c <= -1800 && c >= -3200) band++;
+            sum += c;
+            sq += (int64_t) c * c;
+            if (abs((int) c) > peak) peak = abs((int) c);
+            p2 = p1;
+            p1 = c;
+            if (++n >= 8000) {
+              ESP_LOGI("micdiag", "cycle=%d outliers=%u neg=%u range=[%d,%d] ex=%d,%d,%d,%d band=%u dc=%d rms=%d peak=%d chunks=%u size=[%u,%u] odd=%u",
+                       id(diag_cycle), (unsigned) outl, (unsigned) neg, omin, omax,
+                       outl > 0 ? ex[0] : 0, outl > 1 ? ex[1] : 0, outl > 2 ? ex[2] : 0, outl > 3 ? ex[3] : 0,
+                       (unsigned) band, (int) (sum / (int64_t) n), (int) sqrtf((float) sq / n), peak, (unsigned) chunks, (unsigned) cmin, (unsigned) cmax, (unsigned) odd);
+              n = outl = neg = band = chunks = odd = 0;
+              cmin = 1u << 30;
+              cmax = 0;
+              sum = 0;
+              sq = 0;
+              peak = 0;
+            }
+          }
+
+interval:
+  - interval: 6s
+    startup_delay: 20s
+    then:
+      - lambda: |-
+          if (id(diag_cycle) == 0) {
+            const uint8_t regs[] = {0x00, 0x01, 0x02, 0x09, 0x0A, 0x14, 0x15, 0x16, 0x17, 0x1B, 0x1C, 0x44, 0x45};
+            for (uint8_t r : regs) {
+              uint8_t v = 0xEE;
+              auto err = id(bus_a)->write_readv(0x18, &r, 1, &v, 1);
+              ESP_LOGI("micdiag", "ES8311 reg 0x%02X = 0x%02X (err %d)", r, v, (int) err);
+            }
+          }
+          id(diag_cycle) += 1;
+          ESP_LOGI("micdiag", "restart cycle=%d", id(diag_cycle));
+      - micro_wake_word.stop
+      - delay: 400ms
+      - micro_wake_word.start
