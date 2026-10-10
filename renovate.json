@@ -12,6 +12,7 @@
       ],
       "matchStrings": [
         "esphome==(?<currentValue>\\d+\\.\\d+\\.\\d+)",
+        "ESPHOME_VERSION:\\s*\"?(?<currentValue>\\d+\\.\\d+\\.\\d+)\"?",
         "esphome-version:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)",
         "min_version:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"
       ],
