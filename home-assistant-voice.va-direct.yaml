@@ -30,6 +30,11 @@ substitutions:
   easter_egg_tick_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tick.mp3
   easter_egg_tada_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tada.mp3
   error_cloud_expired_sound_file: sounds/error_cloud_expired_30.mp3
+  # va-direct: arguments for va_core's input-policy calls (va_client.h) —
+  # the HA media state the button decision needs, and whether a mww
+  # detection is the stop model (its label has been seen as "Stop").
+  button_media_state: 'id(external_media_player).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING, id(external_media_player).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING'
+  wake_is_stop: 'wake_word == "Stop" || wake_word == "stop"'
   # va-direct: voice-assistant WS endpoint on the Pi (mDNS resolves on LAN).
   va_url: "ws://va.local:3001/voice"
   # va_device_token must be defined in secrets.yaml (do NOT inline)
@@ -51,12 +56,10 @@ esphome:
       # to no_ha_connection (red twinkle) until both wifi and va_client WS
       # come up — then it falls through to the idle phase naturally.
       - lambda: id(init_in_progress) = false;
-      # Seed va_client with the restored media_player volume so the first
-      # TTS reply respects the user's volume setting instead of blasting
-      # at 100% until they touch the +/- buttons.
-      - lambda: |-
-          id(va).set_volume(id(external_media_player).is_muted() ? 0.0f
-                                                                 : id(external_media_player).volume);
+      # The assistant's voice rides the same codec volume / mute as every other
+      # sound (see the media_player hooks) — va_client's own multiplier only
+      # mirrors mute.
+      - lambda: 'id(va).set_volume(id(external_media_player).is_muted() ? 0.0f : 1.0f);'
       - micro_wake_word.start:
       - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
       - script.execute: control_leds
@@ -201,18 +204,6 @@ globals:
     type: int
     restore_value: no
     initial_value: ${voice_assist_not_ready_phase_id}
-  # va-direct: true while a follow-up window (ambient or chimed) is behind the
-  # current `listening` phase. Consulted by on_phase to keep the `stop` wake
-  # word armed during follow-up listening — the phase emit from
-  # commit_followup_mic() is deferred, so on_phase runs AFTER on_followup_opened
-  # and would otherwise disarm anything the script armed. Set by
-  # on_followup_opened (chimed) or by on_phase itself when `listening` arrives
-  # out of idle (ambient window — no yaml hook exists for that path); cleared
-  # on any non-listening phase and before every locally-started session.
-  - id: followup_listening
-    type: bool
-    restore_value: no
-    initial_value: 'false'
   # Global variable tracking if the dial was recently touched.
   - id: dial_touched
     type: bool
@@ -267,6 +258,8 @@ switch:
           then:
             - microphone.unmute:
     on_turn_on:
+      # A listening window would just stream silence until a watchdog fired.
+      - lambda: id(va)->on_mic_muted();
       - script.execute: control_leds
     on_turn_off:
       - script.execute: control_leds
@@ -317,12 +310,11 @@ binary_sensor:
           then:
             - button.press: factory_reset_button
     on_multi_click:
-      # Simple Click:
-      #   - Abort "things" in order
-      #     - Announcements
-      #     - Voice Assistant Pipeline run
-      #     - Music
-      #   - Starts the voice assistant if it is not yet running and if the device is not muted.
+      # Simple Click: do the most specific thing available. The decision is
+      # va_core's button_action() — announcement, then the assistant's own
+      # turn, then HA media, then a new turn — asked in back-to-back nested
+      # conditions (nothing runs between them, so it is one decision). yaml
+      # only performs the chosen action.
       - timing:
           - ON for at most 1s
           - OFF for at least 0.25s
@@ -333,50 +325,43 @@ binary_sensor:
               then:
                 - if:
                     condition:
-                      media_player.is_announcing:
-                        id: external_media_player
+                      lambda: 'return id(va)->button_action(${button_media_state}) == va_client::ButtonAction::StopAnnouncement;'
                     then:
-                      media_player.stop:
-                        announcement: true
-                        id: external_media_player
+                      - media_player.stop:
+                          announcement: true
+                          id: external_media_player
                     else:
                       - if:
                           condition:
-                            media_player.is_playing:
-                              id: external_media_player
+                            lambda: 'return id(va)->button_action(${button_media_state}) == va_client::ButtonAction::Cancel;'
                           then:
-                            - media_player.pause:
-                                id: external_media_player
+                            # A turn is in flight (listening / thinking /
+                            # replying / follow-up window): cancel it. No
+                            # chime, no new session.
+                            - lambda: id(va)->send_interrupt();
+                            - speaker.stop:
+                                id: media_resampling_speaker
+                            - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+                            - script.execute: control_leds
                           else:
-                            # If a va_client session is already in flight
-                            # (any non-idle phase: waiting/listening/
-                            # thinking/replying) — treat this press as
-                            # "cancel". No wake chime, no new session.
-                            # Otherwise: fresh start.
                             - if:
                                 condition:
-                                  lambda: 'return id(voice_assistant_phase) != ${voice_assist_idle_phase_id};'
+                                  lambda: 'return id(va)->button_action(${button_media_state}) == va_client::ButtonAction::PauseMedia;'
                                 then:
-                                  - lambda: |-
-                                      id(followup_listening) = false;
-                                      id(va)->send_interrupt();
-                                  - speaker.stop:
-                                      id: media_resampling_speaker
-                                  - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
-                                  - script.execute: control_leds
+                                  - media_player.pause:
+                                      id: external_media_player
                                 else:
                                   - if:
                                       condition:
                                         switch.is_off: master_mute_switch
                                       then:
-                                        # Backend down? Same guard as the
-                                        # wake-word path: don't pretend to
-                                        # listen — play the error chime so
-                                        # the failure mode is audible.
                                         - if:
                                             condition:
-                                              lambda: 'return !id(va)->is_connected();'
+                                              lambda: 'return id(va)->button_action(${button_media_state}) == va_client::ButtonAction::NotConnected;'
                                             then:
+                                              # Backend down: don't pretend to
+                                              # listen — the error chime makes
+                                              # the failure audible.
                                               - script.execute:
                                                   id: play_sound
                                                   priority: true
@@ -393,13 +378,7 @@ binary_sensor:
                                                         id: external_media_player
                                                   timeout: 2s
                                               - delay: 600ms
-                                              # Fresh session: a leftover
-                                              # follow-up flag must not keep
-                                              # `stop` armed over the user's
-                                              # own utterance.
-                                              - lambda: |-
-                                                  id(followup_listening) = false;
-                                                  id(va)->start_session();
+                                              - lambda: id(va)->start_session();
                                               - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
                                               - script.execute: control_leds
       # Double Click
@@ -1477,20 +1456,17 @@ media_player:
     volume_increment: 0.05
     volume_min: 0.4
     volume_max: 0.85
-    # Mirror the media_player volume / mute state into va_client so the
-    # physical +/- buttons, mute switch AND the HA-side volume slider all
-    # scale our TTS output. Without this hook va_client writes into
-    # media_resampling_speaker bypassing the media_player, so the volume
-    # control would only affect announcements (HA scripts, wake / mute /
-    # error chimes) — not the assistant's voice.
-    on_volume:
-      - lambda: |-
-          id(va).set_volume(id(external_media_player).is_muted() ? 0.0f
-                                                                 : id(external_media_player).volume);
+    # Volume and mute already reach the assistant's voice: the media_player
+    # pushes them down its pipelines' speaker chains to the shared i2s leaf,
+    # which sets the AIC3204's hardware volume / mute — and va_client's lane
+    # (media_resampling_speaker → mixer → same leaf) plays through that DAC.
+    # Scaling the samples by the volume too attenuated the voice twice (−6 dB
+    # vs the chimes at half volume, silent at volume 0 while chimes played),
+    # so va_client stays at unity and only mirrors mute.
     on_mute:
       - lambda: 'id(va).set_volume(0.0f);'
     on_unmute:
-      - lambda: 'id(va).set_volume(id(external_media_player).volume);'
+      - lambda: 'id(va).set_volume(1.0f);'
 
 sendspin:
   id: sendspin_hub
@@ -1613,19 +1589,6 @@ va_client:
   speaker: media_resampling_speaker
   on_phase:
     - lambda: |-
-        // Follow-up bookkeeping BEFORE the phase mapping below overwrites
-        // voice_assistant_phase. `listening` arriving while yaml still shows
-        // idle is a follow-up window opening ambiently (the silent path in
-        // va_core's finish_drain_/on_tick emits it with no yaml hook); every
-        // locally-started session passes through waiting_for_command /
-        // listening_for_command first, so it can't false-positive here. The
-        // chimed path sets the flag explicitly in on_followup_opened.
-        if (phase == "listening" &&
-            id(voice_assistant_phase) == ${voice_assist_idle_phase_id}) {
-          id(followup_listening) = true;
-        } else if (phase != "listening") {
-          id(followup_listening) = false;
-        }
         if (phase == "idle") {
           id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
         } else if (phase == "listening") {
@@ -1651,18 +1614,14 @@ va_client:
             script.is_running: stop_feedback_flash
         then:
           - script.execute: control_leds
-    # Arm the "stop" wake word while the assistant is speaking OR while a
-    # follow-up window is behind the current listening phase (user changed
-    # their mind — "отмени"/"stop"); disarm otherwise to prevent false
-    # positives during normal user speech and idle silence. The follow-up
-    # case MUST be decided here and not in on_followup_opened: phase emits
-    # are deferred to the next loop pass, so this automation always runs
-    # after that script — an enable_model there would be undone by the
-    # else-branch below. Replaces the original activate_stop_word_once
-    # which was keyed on external_media_player.is_announcing.
+    # Arm the "stop" wake word exactly when va_core says there is something
+    # to stop (the assistant audible, or the mic open in a follow-up window)
+    # and disarm it otherwise — a false "stop" must not kill the user's own
+    # fresh utterance. Asked on every phase change; the core answers from its
+    # live state, so the deferred emit can't make it stale.
     - if:
         condition:
-          lambda: 'return phase == "replying" || (phase == "listening" && id(followup_listening));'
+          lambda: 'return id(va)->stop_word_armed();'
         then:
           - micro_wake_word.enable_model: stop
         else:
@@ -1714,20 +1673,14 @@ va_client:
     # the user's real answer then lands mid-response. 800 ms lets
     # the echo decay before the mic opens.
     - delay: 800ms
-    # Only commit if nothing pre-empted the window while the chime played
-    # (a wake word / stop during the chime moves the phase off idle and
-    # commit_followup_mic() would no-op — don't repaint the LED or leave a
-    # stale followup_listening flag in that case). Setting the flag BEFORE
-    # commit matters: the phase emit from commit_followup_mic() is deferred,
-    # so on_phase runs after this script and arms `stop` from the flag —
-    # arming it directly here would be undone by that same on_phase run.
+    # Only commit if nothing pre-empted the window while the chime played (a
+    # wake word / stop / button during the chime) — otherwise don't repaint
+    # the LED. The commit's own phase emit re-arms `stop` via on_phase.
     - if:
         condition:
-          lambda: 'return id(voice_assistant_phase) == ${voice_assist_idle_phase_id};'
+          lambda: 'return id(va)->followup_commit_pending();'
         then:
-          - lambda: |-
-              id(followup_listening) = true;
-              id(va)->commit_followup_mic();
+          - lambda: id(va)->commit_followup_mic();
           - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
           - script.execute: control_leds
 
@@ -1761,43 +1714,29 @@ micro_wake_word:
         condition:
           switch.is_off: master_mute_switch
         then:
-          # The "stop" model is special — it's a cancel signal, not a
-          # session-start. We want it to work in any non-idle phase:
-          # during replying (current barge-in), but also during the
-          # follow-up listening window (user changed their mind) and
-          # while server VAD has us in listening/thinking (user wants
-          # to abort their own utterance). mww reports the wake word
-          # label, which has been observed as "Stop" (capital) on
-          # this model — check both forms case-defensively.
+          # What this detection means is va_core's wake_action(): "stop" aborts
+          # a turn in progress (ignored with none); any other wake word barges
+          # in over an audible reply, or starts a fresh turn. Asked in
+          # back-to-back nested conditions, so it is one decision.
           - if:
               condition:
-                lambda: 'return wake_word == "Stop" || wake_word == "stop";'
+                lambda: 'return id(va)->wake_action(${wake_is_stop}) == va_client::WakeAction::Abort;'
               then:
-                # Cancel anything in flight (reply, follow-up listening,
-                # user STT). send_interrupt() flushes the audio queue and
-                # tells the server to drop the response. No-op in idle.
-                - if:
-                    condition:
-                      lambda: 'return id(voice_assistant_phase) != ${voice_assist_idle_phase_id};'
-                    then:
-                      - lambda: |-
-                          id(followup_listening) = false;
-                          id(va)->send_interrupt();
-                      - speaker.stop:
-                          id: media_resampling_speaker
-                      - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
-                      # Red-ring feedback that the stop registered, then
-                      # repaint to idle (stop_feedback_flash ends in
-                      # control_leds after 800 ms).
-                      - script.execute: stop_feedback_flash
-                      - micro_wake_word.disable_model: stop
+                # Cancel anything in flight (reply, follow-up listening, user
+                # STT): send_interrupt() flushes, closes the turn locally and
+                # tells the server to drop the response.
+                - lambda: id(va)->send_interrupt();
+                - speaker.stop:
+                    id: media_resampling_speaker
+                - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+                # Red-ring feedback that the stop registered, then repaint to
+                # idle (stop_feedback_flash ends in control_leds after 800 ms).
+                - script.execute: stop_feedback_flash
+                - micro_wake_word.disable_model: stop
               else:
-                # Non-stop wake word: branch on the assistant's current
-                # phase. Wake fired while replying = barge-in (interrupt
-                # the reply); idle/listening/thinking → fresh session.
                 - if:
                     condition:
-                      lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
+                      lambda: 'return id(va)->wake_action(${wake_is_stop}) == va_client::WakeAction::BargeIn;'
                     then:
                       # Barge-in. Drop the queued TTS still sitting in
                       # va_client's PSRAM ring AND stop the downstream
@@ -1811,8 +1750,6 @@ micro_wake_word:
                       # to re-feed. The server-side cancel is carried by
                       # start_session()'s `start` message below (the
                       # bridge cancels the in-flight reply on `start`).
-                      # We no longer send a separate interrupt here —
-                      # interrupt now means "abort to idle", not "barge".
                       - lambda: 'id(va)->flush_audio_queue();'
                       # Neutralise the draining old turn so the chime wait
                       # below can't let finish_drain_ open a stray follow-up
@@ -1820,12 +1757,9 @@ micro_wake_word:
                       - lambda: 'id(va)->prepare_barge_in();'
                       - speaker.stop:
                           id: media_resampling_speaker
-                      # Play the same wake chime as fresh-session so the
-                      # user gets an audible cue that the mic actually
-                      # reopened — without it the device just silences
-                      # mid-reply and the user can't tell whether they
-                      # need to repeat themselves. Skipped when the
-                      # server disabled the wake sound (realtime.wakeChime).
+                      # Same wake chime as a fresh session, so the user hears
+                      # that the mic reopened. Skipped when the server
+                      # disabled the wake sound (realtime.wakeChime).
                       - if:
                           condition:
                             lambda: 'return id(va)->wake_sound_enabled();'
@@ -1844,86 +1778,71 @@ micro_wake_word:
                             # off the mic so XMOS AEC doesn't leak it
                             # back as "Ok, nabu" into the new turn.
                             - delay: 400ms
-                      # Open the mic locally and tell the bridge a new
-                      # turn is starting. start_session() sends `start`,
-                      # which the bridge turns into "cancel the in-flight
-                      # reply + go to listening" — so this single call
-                      # both barges in and reopens the mic. Fresh turn:
-                      # drop any leftover follow-up flag so `stop` isn't
-                      # armed over the user's own utterance.
-                      - lambda: |-
-                          id(followup_listening) = false;
-                          id(va)->start_session();
+                      # start_session() sends `start`, which the bridge turns
+                      # into "cancel the in-flight reply + go to listening" —
+                      # this single call both barges in and reopens the mic.
+                      - lambda: id(va)->start_session();
                       - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
                       - script.execute: control_leds
                     else:
-                      # Backend down? Don't pretend to listen. Without
-                      # this guard we'd play the wake chime + start
-                      # streaming, on_mic_data_ would silently drop
-                      # every frame (!ws_connected_), and 7 s later
-                      # the no-speech watchdog would close the session
-                      # — user has no idea why nothing happened.
-                      # Play the same error chime as on_repeated_failure
-                      # so the failure mode is audible.
                       - if:
                           condition:
-                            lambda: 'return !id(va)->is_connected();'
+                            lambda: 'return id(va)->wake_action(${wake_is_stop}) == va_client::WakeAction::NotConnected;'
                           then:
+                            # Backend down? Don't pretend to listen. Without
+                            # this guard we'd play the wake chime and stream
+                            # into nothing until the no-speech watchdog closed
+                            # the session — the user has no idea why nothing
+                            # happened. The error chime makes it audible.
                             - script.execute:
                                 id: play_sound
                                 priority: true
                                 sound_file: "error_cloud_expired"
                           else:
-                            # Regular wake word: play wake chime, start a new session.
-                            # Stop the TTS playback chain first. The previous turn may
-                            # still have downstream ring residual (~600 ms) even after
-                            # the server said phase=idle — the `start` we send next makes
-                            # the bridge cancel upstream + flush its side, but the local
-                            # leaf ring buffers it can't reach. Without this stop the
-                            # tail of the old reply leaks under the wake chime.
-                            # No-op when there's nothing playing.
-                            - speaker.stop:
-                                id: media_resampling_speaker
                             - if:
                                 condition:
-                                  lambda: 'return id(va)->wake_sound_enabled();'
+                                  lambda: 'return id(va)->wake_action(${wake_is_stop}) == va_client::WakeAction::Start;'
                                 then:
-                                  - script.execute:
-                                      id: play_sound
-                                      priority: true
-                                      sound_file: "wake_word_triggered_sound"
-                                  # Wait until the chime has actually finished
-                                  # playing through the speaker — a fixed 300ms
-                                  # delay was racing with the ~500ms FLAC and the
-                                  # mic was streaming the chime tail to OpenAI
-                                  # (which transcribed it as "Ok, nabu").
-                                  - wait_until:
+                                  # Regular wake word: play wake chime, start a new session.
+                                  # Stop the TTS playback chain first. The previous turn may
+                                  # still have downstream ring residual (~600 ms) even after
+                                  # the server said phase=idle — the `start` we send next makes
+                                  # the bridge cancel upstream + flush its side, but the local
+                                  # leaf ring buffers it can't reach. Without this stop the
+                                  # tail of the old reply leaks under the wake chime.
+                                  # No-op when there's nothing playing.
+                                  - speaker.stop:
+                                      id: media_resampling_speaker
+                                  - if:
                                       condition:
-                                        not:
-                                          media_player.is_announcing:
-                                            id: external_media_player
-                                      timeout: 2s
-                                  # Downstream i2s_audio_speaker ring buffer is
-                                  # still draining. 600 ms was conservative —
-                                  # 400 ms covers the typical tail without
-                                  # noticeable risk of the chime leaking into
-                                  # the mic (XMOS AEC catches the residual).
-                                  # Saves ~200 ms of "dead corridor" where the
-                                  # user can't yet be heard.
-                                  - delay: 400ms
-                            # Fresh turn: drop any leftover follow-up
-                            # flag (a wake word inside an open follow-up
-                            # window lands here) so `stop` isn't armed
-                            # over the user's own utterance.
-                            - lambda: |-
-                                id(followup_listening) = false;
-                                id(va)->start_session();
-                            # Show "waiting for command" (blue spin) immediately on wake,
-                            # before the server VAD detects actual speech. va_client's
-                            # on_phase will overwrite to phase 3 (listening_for_command)
-                            # once the server reports speech started.
-                            - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
-                            - script.execute: control_leds
+                                        lambda: 'return id(va)->wake_sound_enabled();'
+                                      then:
+                                        - script.execute:
+                                            id: play_sound
+                                            priority: true
+                                            sound_file: "wake_word_triggered_sound"
+                                        # Wait until the chime has actually finished
+                                        # playing through the speaker — a fixed 300ms
+                                        # delay was racing with the ~500ms FLAC and the
+                                        # mic was streaming the chime tail to OpenAI
+                                        # (which transcribed it as "Ok, nabu").
+                                        - wait_until:
+                                            condition:
+                                              not:
+                                                media_player.is_announcing:
+                                                  id: external_media_player
+                                            timeout: 2s
+                                        # Downstream i2s_audio_speaker ring buffer is
+                                        # still draining. 400 ms covers the typical
+                                        # tail (XMOS AEC catches the residual).
+                                        - delay: 400ms
+                                  - lambda: id(va)->start_session();
+                                  # Show "waiting for command" (blue spin) immediately on wake,
+                                  # before the server VAD detects actual speech. va_client's
+                                  # on_phase will overwrite to phase 3 (listening_for_command)
+                                  # once the server reports speech started.
+                                  - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+                                  - script.execute: control_leds
 
 select:
   - platform: template

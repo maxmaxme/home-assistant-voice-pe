@@ -15,6 +15,8 @@ using esphome::va_client::Actions;
 using esphome::va_client::VaCore;
 using State = VaCore::State;
 using AT = Action::Type;
+using esphome::va_client::ButtonAction;
+using esphome::va_client::WakeAction;
 
 namespace {
 
@@ -1098,6 +1100,133 @@ TEST(a_malformed_turn_tag_is_dropped) {
   f.text("{\"type\":\"phase\",\"value\":\"thinking\",\"turn\":\"x\"}");
   f.text("{\"type\":\"phase\",\"value\":\"thinking\",\"turn\":-3}");
   CHECK_EQ(f.core.state(), State::Listening);
+}
+
+// ---- Input policy (decisions yaml used to make from LED globals) ---------------
+
+TEST(stop_word_is_armed_only_when_there_is_something_to_stop) {
+  Fixture f;
+  f.connect();
+  CHECK(!f.core.stop_word_armed());  // idle silence
+  f.wake();
+  CHECK(!f.core.stop_word_armed());  // the user's own fresh utterance
+  f.phase("listening");
+  CHECK(!f.core.stop_word_armed());
+  f.phase("thinking");
+  CHECK(!f.core.stop_word_armed());
+  f.phase("replying");
+  CHECK(f.core.stop_word_armed());  // assistant audible
+  f.fill = 4096;
+  f.drained = false;
+  f.text("{\"type\":\"follow_up\",\"ms\":8000}");
+  f.phase("idle");
+  CHECK_EQ(f.core.state(), State::WaitingDrain);
+  CHECK(f.core.stop_word_armed());  // the reply tail is still playing
+  f.play_out();
+  CHECK_EQ(f.core.state(), State::Idle);
+  CHECK(!f.core.stop_word_armed());  // echo guard: nothing audible, mic closed
+  f.run_for(VaCore::kFollowupOpenDelayMs + 10);
+  CHECK_EQ(f.core.state(), State::FollowupArmed);
+  CHECK(f.core.stop_word_armed());  // ambient window open
+  f.phase("listening");  // the user speaks into the window
+  CHECK(f.core.stop_word_armed());  // still a follow-up — they may say "stop"
+  f.phase("thinking");
+  CHECK(!f.core.stop_word_armed());
+}
+
+TEST(stop_word_follows_the_chimed_followup_handoff) {
+  Fixture f;
+  f.connect();
+  f.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000,\"chime\":true}");
+  f.play_out();
+  CHECK(f.core.followup_commit_pending());
+  CHECK(!f.core.stop_word_armed());  // chime playing, mic still closed
+  f.commit();
+  CHECK(!f.core.followup_commit_pending());
+  CHECK(f.core.stop_word_armed());
+}
+
+TEST(a_wake_inside_a_followup_window_is_a_fresh_turn_for_stop_arming) {
+  Fixture f;
+  f.connect();
+  f.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000}");
+  f.play_out();
+  f.run_for(VaCore::kFollowupOpenDelayMs + 10);
+  CHECK(f.core.stop_word_armed());
+  f.wake();
+  CHECK(!f.core.stop_word_armed());
+}
+
+TEST(wake_action_routes_from_core_state) {
+  Fixture f;
+  CHECK(f.core.wake_action(false) == WakeAction::NotConnected);
+  CHECK(f.core.wake_action(true) == WakeAction::Ignore);
+  f.connect();
+  CHECK(f.core.wake_action(false) == WakeAction::Start);
+  CHECK(f.core.wake_action(true) == WakeAction::Ignore);
+  f.wake();
+  CHECK(f.core.wake_action(true) == WakeAction::Abort);
+  CHECK(f.core.wake_action(false) == WakeAction::Start);  // restart own turn
+  f.phase("thinking");
+  CHECK(f.core.wake_action(false) == WakeAction::Start);
+  f.phase("replying");
+  CHECK(f.core.wake_action(false) == WakeAction::BargeIn);
+  f.fill = 100;
+  f.drained = false;
+  f.phase("idle");
+  CHECK_EQ(f.core.state(), State::WaitingDrain);
+  CHECK(f.core.wake_action(false) == WakeAction::BargeIn);  // tail audible
+  CHECK(f.core.wake_action(true) == WakeAction::Abort);
+}
+
+TEST(button_cancels_the_turn_before_pausing_media) {
+  // The music plays on its own mixer lane alongside a reply: a press must
+  // stop the assistant, not pause the music while it keeps talking.
+  Fixture f;
+  f.connect();
+  f.wake();
+  f.phase("replying");
+  CHECK(f.core.button_action(false, true) == ButtonAction::Cancel);
+  CHECK(f.core.button_action(true, true) == ButtonAction::StopAnnouncement);
+  f.interrupt();
+  CHECK(f.core.button_action(false, true) == ButtonAction::PauseMedia);
+  CHECK(f.core.button_action(false, false) == ButtonAction::Start);
+  f.disconnect();
+  CHECK(f.core.button_action(false, false) == ButtonAction::NotConnected);
+  CHECK(f.core.button_action(false, true) == ButtonAction::PauseMedia);
+}
+
+TEST(button_cancels_a_followup_window) {
+  Fixture f;
+  f.connect();
+  f.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000}");
+  f.play_out();
+  f.run_for(VaCore::kFollowupOpenDelayMs + 10);
+  CHECK(f.core.button_action(false, false) == ButtonAction::Cancel);
+}
+
+TEST(mic_mute_ends_a_listening_window_but_not_a_reply) {
+  Fixture f;
+  f.connect();
+  f.wake();
+  f.core.on_mic_muted(f.now, f.log);
+  CHECK_EQ(f.core.state(), State::Idle);
+  CHECK(!f.core.is_mic_streaming());
+
+  f.wake();
+  f.phase("replying");
+  f.core.on_mic_muted(f.now, f.log);
+  CHECK_EQ(f.core.state(), State::Replying);  // the assistant keeps talking
+
+  Fixture g;
+  g.connect();
+  g.spoken_turn_until_idle("{\"type\":\"follow_up\",\"ms\":8000}");
+  g.play_out();
+  g.run_for(VaCore::kFollowupOpenDelayMs + 10);
+  CHECK_EQ(g.core.state(), State::FollowupArmed);
+  g.core.on_mic_muted(g.now, g.log);
+  CHECK_EQ(g.core.state(), State::Idle);
+  CHECK(!g.core.is_mic_streaming());
 }
 
 int main() { return run_all_tests(); }

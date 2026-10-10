@@ -278,8 +278,12 @@ media_player:
     volume_min: 0.75
     volume_max: 0.9
     volume_initial: 0.75
-    # Mirror volume / mute into va_client's software scale (same as Voice PE)
-    # so the slider controls the assistant's voice too.
+    # Mirror volume / mute into va_client's software scale so the slider
+    # controls the assistant's voice too. NOTE: the ES8311 register already
+    # gets the volume through the shared i2s leaf, so this scale STACKS on it —
+    # deliberately here (see on_boot: keeps the assistant below full-scale
+    # announcements on the loud NS4150B amp). The Voice PE config dropped the
+    # stacking; don't copy that here without re-measuring the loudness.
     on_volume:
       - lambda: |-
           id(va).set_volume(id(external_media_player).is_muted() ? 0.0f
@@ -335,14 +339,6 @@ globals:
     type: std::string
     restore_value: no
     initial_value: '"idle"'
-  # True while a follow-up window (ambient or chimed) is behind the current
-  # `listening` phase. Consulted by on_phase to keep the `stop` wake word
-  # armed during follow-up listening; cleared on any non-listening phase and
-  # before every locally-started session.
-  - id: followup_listening
-    type: bool
-    restore_value: no
-    initial_value: 'false'
   # True while any rtttl tone (wake beep or a cue) is playing. on_phase's
   # idle→mww.start is skipped while set, so the phase machine doesn't grab the
   # mic bus mid-tone; the tone's own on_finished_playback restarts mww.
@@ -407,10 +403,8 @@ rtttl:
         condition:
           lambda: 'return id(pending_followup);'
         then:
-          # Arm the flag right before commit so on_phase (deferred) reads it.
           - lambda: |-
               id(pending_followup) = false;
-              id(followup_listening) = true;
               id(va)->commit_followup_mic();
 
 micro_wake_word:
@@ -443,22 +437,24 @@ micro_wake_word:
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
   on_wake_word_detected:
-    # The "stop" model is a cancel signal, not a session start. send_interrupt()
-    # is a no-op when idle, so an unconditional call is safe.
+    # The "stop" model is a cancel signal, not a session start: it aborts a
+    # turn in progress (va_core's wake_action()) and is ignored otherwise.
     - if:
         condition:
           lambda: 'return wake_word == "Stop" || wake_word == "stop";'
         then:
-          - lambda: |-
-              id(followup_listening) = false;
-              id(va)->send_interrupt();
-          - script.execute:
-              id: play_cue
-              song: "cancel:d=16,o=5,b=200:g,e"
+          - if:
+              condition:
+                lambda: 'return id(va)->wake_action(true) == va_client::WakeAction::Abort;'
+              then:
+                - lambda: id(va)->send_interrupt();
+                - script.execute:
+                    id: play_cue
+                    song: "cancel:d=16,o=5,b=200:g,e"
         else:
           # Fresh turn — same path as the button press (see the start_turn
-          # script): clears the follow-up flag, pre-marks va_phase, beeps, and
-          # opens the mic once the beep's bus lock clears.
+          # script): pre-marks va_phase, beeps, and opens the mic once the
+          # beep's bus lock clears.
           - script.execute: start_turn
 
 button:
@@ -518,23 +514,11 @@ va_client:
   mic_gain: 8
   speaker: va_speaker
   on_phase:
-    # Stop-model choreography (mirrors the Voice PE config): arm `stop` while
-    # the assistant is speaking OR while a follow-up window is behind the
-    # current listening phase; disarm otherwise so a false "stop" can't kill
-    # the user's own utterance mid-turn. The follow-up case must be decided
-    # here: phase emits are deferred to the next loop pass, so this automation
-    # runs AFTER on_followup_opened and would undo anything armed there.
-    - lambda: |-
-        // `listening` arriving while we still think we're idle = the silent
-        // ambient follow-up window opening (va_core emits it with no yaml
-        // hook); local sessions pre-set va_phase to "waiting" first, and the
-        // chimed path sets the flag in on_followup_opened.
-        if (phase == "listening" && id(va_phase) == "idle") {
-          id(followup_listening) = true;
-        } else if (phase != "listening") {
-          id(followup_listening) = false;
-        }
-        id(va_phase) = phase;
+    # Stop-model choreography (mirrors the Voice PE config): `stop` is armed
+    # exactly when va_core's stop_word_armed() says there is something to stop
+    # (assistant audible, or the mic open in a follow-up window) — see the
+    # last `if` below.
+    - lambda: id(va_phase) = phase;
     # Shared I2S bus is a mutex (see the speaker block): micro_wake_word holds
     # the mic, so the speaker can't take the bus for the reply until mww
     # releases it. Stop mww on `thinking` — the user's turn is already captured
@@ -557,7 +541,7 @@ va_client:
           - micro_wake_word.start
     - if:
         condition:
-          lambda: 'return phase == "replying" || (phase == "listening" && id(followup_listening));'
+          lambda: 'return id(va)->stop_word_armed();'
         then:
           - micro_wake_word.enable_model: stop
         else:
@@ -568,11 +552,11 @@ va_client:
     # on_finished_playback (pending_followup) once the chime ends and the bus is
     # free — same handoff as the wake beep.
     - delay: 700ms
-    # Skip if something pre-empted the window during the delay (wake word / stop
-    # moved us off idle — commit_followup_mic() would no-op).
+    # Skip if something pre-empted the window during the delay (wake word /
+    # stop / button — commit_followup_mic() would no-op).
     - if:
         condition:
-          lambda: 'return id(va_phase) == "idle";'
+          lambda: 'return id(va)->followup_commit_pending();'
         then:
           - lambda: |-
               id(tone_playing) = true;
@@ -596,9 +580,7 @@ va_client:
 script:
   - id: start_turn
     then:
-      - lambda: |-
-          id(followup_listening) = false;
-          id(va_phase) = "waiting";
+      - lambda: id(va_phase) = "waiting";
       - if:
           condition:
             lambda: 'return id(va).wake_sound_enabled();'
@@ -654,9 +636,7 @@ binary_sensor:
             then:
               - script.execute: start_turn
             else:
-              - lambda: |-
-                  id(followup_listening) = false;
-                  id(va)->send_interrupt();
+              - lambda: id(va)->send_interrupt();
               - script.execute:
                   id: play_cue
                   song: "cancel:d=16,o=5,b=200:g,e"

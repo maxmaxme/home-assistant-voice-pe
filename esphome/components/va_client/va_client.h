@@ -82,12 +82,12 @@ class VaClient : public Component {
   void set_mic_mono16(bool m) { mic_mono16_ = m; }
   void set_mic_gain(uint8_t g) { mic_gain_ = g; }
   void set_speaker(speaker::Speaker *s) { speaker_ = s; }
-  // Sets the output-volume multiplier applied to TTS in handle_binary_.
-  // Driven from yaml by external_media_player's volume / mute state so the
-  // device's physical +/- buttons and mute switch scale our TTS the same
-  // way they scale chime announcements played through media_player. (No
-  // HA api: block on this firmware — there's no remote slider.) Range
-  // [0, 1]; values are clamped on read so callers don't have to bounds-check.
+  // Output multiplier applied to TTS in handle_binary_, [0, 1] (clamped on
+  // read). NOT the volume control: the media_player's volume and mute reach
+  // the codec (DAC register / DAC mute) through the speaker chain, which our
+  // lane shares, so they already scale the assistant's voice. yaml holds this
+  // at 1 (0 while muted, belt and braces) — scaling here as well attenuated
+  // the voice twice (−6 dB vs the chimes at half volume, silent at 0).
   void set_volume(float v) { volume_ = v; }
   void add_on_phase_trigger(OnPhaseTrigger *t) { phase_triggers_.push_back(t); }
   void add_on_repeated_failure_trigger(OnRepeatedFailureTrigger *t) {
@@ -132,6 +132,19 @@ class VaClient : public Component {
   // (the device has no HA/web control surface for it). Defaults on until the
   // first hello arrives. Read from the yaml wake handler.
   bool wake_sound_enabled() const { return this->core_.wake_sound_enabled(); }
+
+  // Input policy — the decisions yaml used to reconstruct from LED globals,
+  // now answered by the core from its real state (see va_core.h). yaml keeps
+  // only the per-answer choreography.
+  WakeAction wake_action(bool is_stop) const { return this->core_.wake_action(is_stop); }
+  ButtonAction button_action(bool announcing, bool media_playing) const {
+    return this->core_.button_action(announcing, media_playing);
+  }
+  bool stop_word_armed() const { return this->core_.stop_word_armed(); }
+  bool followup_commit_pending() const { return this->core_.followup_commit_pending(); }
+  // Master mic mute switched on: end a listening window instead of streaming
+  // zeros until a watchdog fires. Leaves a reply alone.
+  void on_mic_muted();
 
   // Called from the static esp-idf event handler trampoline.
   void on_ws_event(int32_t event_id, void *event_data);

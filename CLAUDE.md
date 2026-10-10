@@ -148,16 +148,38 @@ sides in lockstep when changing it.
 - `va_client:` block wires the component to `secrets: va_url` /
   `va_device_token`, the i2s microphone (mic channel 0 — XMOS already
   outputs cleaned audio there), and the speaker output.
+- **Decisions live in `va_core`, choreography in yaml.** yaml no longer
+  reconstructs "what should happen" from LED globals; it asks the core
+  (`va_client.h` forwards these):
+  - `wake_action(is_stop)` → `Abort` / `Ignore` (stop word, with or without a
+    turn to stop), `BargeIn` (reply audible), `Start`, `NotConnected`.
+  - `button_action(announcing, media_playing)` → `StopAnnouncement`,
+    `Cancel` (a turn is in progress — checked **before** HA media, which plays
+    on its own mixer lane alongside a reply), `PauseMedia`, `Start`,
+    `NotConnected`.
+  - `stop_word_armed()` — reply audible, or the mic open in a follow-up
+    window (the core tracks that itself; the old `followup_listening` global
+    is gone). `on_phase` enables/disables the `stop` model from it.
+  - `followup_commit_pending()` — the chimed follow-up is still waiting for
+    yaml's commit (nothing pre-empted it during the chime).
+  - `on_mic_muted()` — the master mute ends a listening window (a reply is
+    left alone).
+  The yaml asks in back-to-back nested `if`s (nothing runs between them, so
+  it is one decision) and keeps only chimes, delays and speaker stops. Both
+  are fuzzed through these calls (I7–I9).
 - `on_phase:` maps the phase string to the global
   `voice_assistant_phase` so the original `control_leds` script can
   drive the LED ring without modification. The original script came
-  from upstream; we just keep feeding it. It also owns the `stop`
-  wake-word choreography: armed while `replying` or while a follow-up
-  window is behind the current `listening` (tracked in the
-  `followup_listening` global), disarmed otherwise. Phase emits are
-  deferred to the next loop pass, so `on_phase` always runs *after*
-  whatever yaml script triggered the transition — arming/disarming
-  must be decided here, not in those scripts.
+  from upstream; we just keep feeding it. It arms/disarms the `stop` model
+  from `stop_word_armed()` on every phase change.
+- **Volume (VPE)**: the media_player's volume and mute already reach the
+  assistant's voice — they go down the speaker chains to the shared i2s leaf,
+  i.e. the AIC3204's hardware volume / mute, which va_client's lane plays
+  through too. `va_client.set_volume()` therefore stays at 1 (0 while
+  muted); scaling the samples by the volume as well attenuated the voice
+  twice. The Atom config still stacks its software scale on the ES8311
+  register **on purpose** (keeps the assistant below announcements on the
+  loud NS4150B amp) — don't unify the two without re-measuring loudness.
 - **LED idle deferral** is C++-side, not yaml: `va_core` parks in
   `WaitingDrain` after the server's end-of-turn `idle` and only emits
   the final `idle` phase from `finish_drain_` once the PSRAM ring and
