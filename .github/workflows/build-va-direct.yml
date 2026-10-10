@@ -72,13 +72,22 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends ccache
-      - name: 📦 Restore ccache
+      # Same cache entry also carries the compile-time downloads ESPHome
+      # keeps under .esphome/ (wake word models, the XMOS firmware, the
+      # upstream external_components clone). When a fetch fails, ESPHome
+      # falls back to the cached copy ("using cached file") instead of
+      # failing the build, so a GitHub raw/release 5xx no longer breaks CI.
+      - name: 📦 Restore build cache
         uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809  # v4.2.4
         with:
-          path: ~/.cache/esphome/idf/ccache
-          key: ccache-${{ runner.os }}-${{ matrix.file }}-${{ github.run_id }}
+          path: &build-cache-paths |
+            ~/.cache/esphome/idf/ccache
+            .esphome/micro_wake_word
+            .esphome/voice_kit
+            .esphome/external_components
+          key: build-${{ runner.os }}-${{ matrix.file }}-${{ github.run_id }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ matrix.file }}-
+            build-${{ runner.os }}-${{ matrix.file }}-
       - name: 🔧 Install esphome
         run: pip install esphome==${{ env.ESPHOME_VERSION }}
       - name: 🔑 Stub secrets
@@ -99,9 +108,9 @@ jobs:
       - name: 📊 ccache stats
         if: always()
         run: ccache --dir ~/.cache/esphome/idf/ccache --show-stats || true
-      - name: 💾 Save ccache
+      - name: 💾 Save build cache
         if: success() && github.event_name != 'pull_request'
         uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809  # v4.2.4
         with:
-          path: ~/.cache/esphome/idf/ccache
-          key: ccache-${{ runner.os }}-${{ matrix.file }}-${{ github.run_id }}
+          path: *build-cache-paths
+          key: build-${{ runner.os }}-${{ matrix.file }}-${{ github.run_id }}
