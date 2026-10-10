@@ -91,7 +91,11 @@ jobs:
           echo 'va_device_token_atom: "ci-build-stub"' >> secrets.yaml
           echo 'ap_password: "ci-build-stub"' >> secrets.yaml
       - name: 🔨 Compile
-        run: esphome compile ${{ matrix.file }}
+        run: |
+          # Stats are restored with the cache; zero them so the next step
+          # reports this run's hit rate, not a running total.
+          ccache --dir ~/.cache/esphome/idf/ccache --zero-stats > /dev/null
+          esphome compile ${{ matrix.file }}
       - name: 📊 ccache stats
         if: always()
         run: ccache --dir ~/.cache/esphome/idf/ccache --show-stats || true
