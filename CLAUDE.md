@@ -125,6 +125,16 @@ JSON messages (text frames) interleaved with binary PCM16:
   cancels any reply still in flight on `start`), `interrupt` (abort the
   current turn back to idle — Stop wake word, center-button cancel, or the
   no-speech watchdog; NOT used for barge-in).
+- **Turn ids (proto 2)**: every `start` carries a fresh `turn` (a per-boot
+  counter, never 0); the bridge echoes it on `phase` / `follow_up` / `error`.
+  `va_core` drops a tagged message unless it names the current turn *and*
+  that turn is still open — a local abort closes it, so the bridge's
+  answering idle, a reply or `follow_up` still in flight after a Stop, or a
+  straggler from the turn before a barge-in can't reopen or drive anything
+  (logged at DEBUG as "dropped server message for stale turn"). Untagged
+  messages pass (proto-1 server, `hello`, anything before the first `start`).
+  A server-driven follow-up turn (speech in the ambient window, no `start`)
+  keeps the last start's id and stays accepted.
 - The schema also defines app-level `ping`/`pong`, but this firmware never
   sends `ping` and ignores `pong` — dead surface on this side. Liveness is
   handled at the WS protocol level (the server sends protocol pings;
@@ -274,7 +284,8 @@ an imperative shell:
   messages in any order, checking after every step that (I1) the mic always
   closes on its own if nothing else happens, (I2) the mic only streams while
   the LED shows `listening`, (I3/I4) no sends on a dead WS / no reconnect
-  while up, (I5) no follow-up window after a stop. A failure prints the seed
+  while up, (I5) no follow-up window after a stop, (I6) a message tagged with
+  a closed or older turn changes nothing. A failure prints the seed
   and an event trace; `FUZZ_FIRST_SEED=<n> FUZZ_SEEDS=1 ./tests/host/run.sh`
   reproduces it, `FUZZ_SEEDS`/`FUZZ_STEPS` scale a longer local run. New
   core behaviour should come with a new invariant here, not just an example
