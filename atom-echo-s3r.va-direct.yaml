@@ -309,6 +309,23 @@ switch:
     pin: GPIO18
     restore_mode: ALWAYS_OFF
     internal: true
+  # Software mic mute, exposed to HA (same entity as the Voice PE's "Mute").
+  # A muted microphone hands its callbacks zeros, so the wake word goes deaf
+  # and va_client can only stream silence.
+  - platform: template
+    id: master_mute_switch
+    name: Mute
+    icon: "mdi:microphone-off"
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: 'return id(echo_mic).get_mute_state();'
+    turn_on_action:
+      - microphone.mute: echo_mic
+    turn_off_action:
+      - microphone.unmute: echo_mic
+    on_turn_on:
+      # A listening window would just stream silence until a watchdog fired.
+      - lambda: id(va)->on_mic_muted();
 
 globals:
   # Who may hold the shared I2S bus — mic (micro_wake_word, which also feeds
@@ -638,4 +655,9 @@ binary_sensor:
                         id: play_cue
                         song: "error:d=8,o=4,b=120:c,c"
                   else:
-                    - script.execute: start_turn
+                    # Muted: a turn would only stream silence.
+                    - if:
+                        condition:
+                          switch.is_off: master_mute_switch
+                        then:
+                          - script.execute: start_turn
