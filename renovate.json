@@ -27,10 +27,22 @@
   ],
   "packageRules": [
     {
-      "description": "One grouped PR for every ESPHome pin so CI/build/min_version never drift apart",
+      "description": "Minor/patch/digest bumps ride one weekly PR and merge themselves once CI is green",
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "non-major dependencies",
+      "automerge": true
+    },
+    {
+      "description": "Majors wait for a tick in the Dependency Dashboard",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "One grouped PR for every ESPHome pin so CI/build/min_version never drift apart; firmware bumps are merged by hand",
       "matchDatasources": ["pypi"],
       "matchDepNames": ["esphome"],
-      "groupName": "esphome"
+      "groupName": "esphome",
+      "automerge": false
     }
   ]
 }
