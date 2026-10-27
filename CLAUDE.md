@@ -14,9 +14,9 @@ Voice PE (this firmware)
   │   XMOS DSP does AEC / NS / IC / AGC (configured via voice_kit over I2C)
   │
   └── WebSocket /voice (bearer = this device's token)
-        ──▶ voice-assistant container :3001
-              ──▶ OpenAI Realtime API (gpt-realtime-2)
-              ──▶ HA MCP server (tools only, no voice pipeline)
+        ──▶ pipecat-voice container :3002
+              ──▶ OpenAI Realtime API
+              ──▶ voice-assistant /mcp (tools, prompt, settings) ──▶ HA MCP server
 ```
 
 There is no HA `voice_assistant` integration on the audio path anymore. STT/TTS happen inside the Realtime session in the backend; the device just streams mic audio up and plays speaker audio down.
@@ -52,7 +52,7 @@ The trigger classes live in `va_client.h` (there is no `automation.h` any more):
 
 - **Mic stream**: with `input_format: stereo32` (default) pulls int32 stereo frames from the microphone and drops to int16 mono on the selected `mic_channel`; with `input_format: mono16` forwards already-int16-mono frames. Either way `mic_gain` scales the result (clamped, and on the stereo32 path applied *before* the int16 narrowing so a quiet XMOS signal is amplified from full resolution). Ships PCM16 over the WS as binary frames. **Level is set per unit by measuring, not by ear** — the backend's `MIC_DUMP_DIR` writes the exact uplink to WAV; the VPE measured 41 dB SNR with 22 dB headroom (→ `mic_gain: 4`), the Atom Echo measured 7 dB SNR with 2.7% clipping from too much analog gain (→ PGA and ADC volume cut 24 dB, `micro_wake_word`'s own `gain_factor` raised ×16 to compensate, since the analog knobs feed the wake path too).
 - **Speaker playback**: incoming binary frames are PCM16 audio. A **2 MB PSRAM ring buffer** smooths jitter and lets us defer "ready" LED state until the buffer actually drains.
-- **Phase machine**: `idle → listening → thinking → replying → idle`, driven by `phase` JSON messages from the server (`src/realtime/protocol.ts` in voice-assistant). Each transition fires `on_phase`.
+- **Phase machine**: `idle → listening → thinking → replying → idle`, driven by `phase` JSON messages from the server (`DeviceProtocol` in pipecat-voice's `bot.py`). Each transition fires `on_phase`.
 - **Reconnect**: exponential backoff (1s / 2s / 5s / 10s, capped).
 - **No-speech watchdog**: 7 s after entering `listening` with no audio flowing → tear the session down and return to `idle`. Cancelled once the server confirms speech.
 - **Aborts are local**: `send_interrupt()` (Stop word, center-button cancel, both watchdogs) closes the turn on the device immediately — flush, mic off, `idle` — and only *tells* the bridge. It never waits for the server's answering `idle`: during a follow-up window the bridge is already idle and dedupes it, so waiting used to leave the mic streaming forever. In plain Idle it is a no-op (beyond dropping a pending follow-up window). A WS drop also discards any latched/pending follow-up window.
@@ -68,7 +68,7 @@ JSON messages (text frames) interleaved with binary PCM16:
 - **Turn ids (proto 2)**: every `start` carries a fresh `turn` (a per-boot counter, never 0); the bridge echoes it on `phase` / `follow_up` / `error`. `va_core` drops a tagged message unless it names the current turn *and* that turn is still open — a local abort closes it, so the bridge's answering idle, a reply or `follow_up` still in flight after a Stop, or a straggler from the turn before a barge-in can't reopen or drive anything (logged at DEBUG as "dropped server message for stale turn"). Untagged messages pass (proto-1 server, `hello`, anything before the first `start`). A server-driven follow-up turn (speech in the ambient window, no `start`) keeps the last start's id and stays accepted.
 - The schema also defines app-level `ping`/`pong`, but this firmware never sends `ping` and ignores `pong` — dead surface on this side. Liveness is handled at the WS protocol level (the server sends protocol pings; `esp_websocket_client` auto-answers with pongs).
 
-Defined in voice-assistant's `src/realtime/protocol.ts` — keep both sides in lockstep when changing it.
+The server side lives in pipecat-voice's `bot.py` (`DeviceProtocol`, `VoicePeSerializer`) — keep both sides in lockstep when changing it.
 
 ## yaml-side glue (`home-assistant-voice.va-direct.yaml`)
 
@@ -106,7 +106,7 @@ Timers were **removed** from `home-assistant-voice.va-direct.yaml` (the `timer_r
 - `va_device_token_atom` — the Atom Echo's own bearer token (used by `atom-echo-s3r.va-direct.yaml`). Same story as above: a distinct token registered as its own `voice` device. Each speaker config references its own key, so CI's stub `secrets.yaml` must define both.
 - `ap_password` — shared password for both configs' fallback AP (`"Voice PE Setup"` / `"${friendly_name} Setup"`), used together with `captive_portal:` to reconfigure Wi-Fi without a full reflash.
 
-Not secrets: the backend URL is each config's `va_url` substitution (e.g. `ws://va.local:3001/voice`), and **Wi-Fi credentials aren't in any file** — both configs provision Wi-Fi at runtime (Improv over BLE/serial on the Voice PE; the fallback AP + captive portal on both) and keep them in NVS.
+Not secrets: the backend URL is each config's `va_url` substitution (e.g. `ws://va.local:3002/voice`), and **Wi-Fi credentials aren't in any file** — both configs provision Wi-Fi at runtime (Improv over BLE/serial on the Voice PE; the fallback AP + captive portal on both) and keep them in NVS.
 
 **Whenever a va-direct yaml starts referencing a new `!secret` key**, add it to the CI stub too (`.github/workflows/build-va-direct.yml`, the "🔑 Stub secrets" step) in the same change — otherwise `esphome compile` fails there with "Secret '<name>' not defined" even though it compiles fine locally against the real `secrets.yaml`.
 
@@ -118,7 +118,7 @@ Measured on M3.2 hardware: ~10× speaker → mic leak survives AEC. That makes b
 
 ## Follow-up dialog window (server-driven)
 
-After a **spoken** reply the device can reopen the mic so the user continues without a wake word. **The server owns this decision**, not the firmware: the bridge sends a `follow_up {ms, chime?}` message right before the end-of-turn `phase=idle`, and only after a real reply. So a silent `wait_for_user`, a barge-in interrupt, a tool-only response, and the initial idle send no `follow_up` and never reopen the mic. The knobs live in the voice-assistant **web panel** (Realtime page): `realtime.followUpMs` (ambient window, default 8000, 0 disables), `realtime.requestFollowUpMs` (explicit-question window, default 10000, 0 disables) and `realtime.followUpChime` (default off).
+After a **spoken** reply the device can reopen the mic so the user continues without a wake word. **The server owns this decision**, not the firmware: the bridge sends a `follow_up {ms, chime?}` message right before the end-of-turn `phase=idle`, and only after a real reply. So a silent `wait_for_user`, a barge-in interrupt, a tool-only response, and the initial idle send no `follow_up` and never reopen the mic. The knobs live in the voice-assistant **web panel** (Realtime page): `realtime.requestFollowUpMs` (question window, 0 disables) and `realtime.followUpChime`. The current server opens a window only after a question (the model's `request_follow_up` tool, or a reply ending in "?"); it never sends the ambient flavour.
 
 Two flavours, selected by the `chime` flag (the firmware only ever reads the `ms` the server sends — it doesn't know which knob it came from):
 
@@ -160,4 +160,4 @@ Avoid editing upstream files unless you're cherry-picking from upstream or fixin
 
 ## Keep this file up to date
 
-When the wire protocol changes (in lockstep with voice-assistant's `src/realtime/protocol.ts`), when phase semantics shift, when the follow-up window behaviour changes, or when a TODO comes off the list — update this file in the same change.
+When the wire protocol changes (in lockstep with pipecat-voice's `bot.py`), when phase semantics shift, when the follow-up window behaviour changes, or when a TODO comes off the list — update this file in the same change.

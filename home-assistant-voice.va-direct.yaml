@@ -40,7 +40,7 @@ substitutions:
   button_media_state: 'id(external_media_player).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING, id(external_media_player).state == media_player::MediaPlayerState::MEDIA_PLAYER_STATE_PLAYING'
   wake_is_stop: 'wake_word == "Stop" || wake_word == "stop"'
   # va-direct: voice-assistant WS endpoint on the Pi (mDNS resolves on LAN).
-  va_url: "ws://va.local:3001/voice"
+  va_url: "ws://va.local:3002/voice"
   # va_device_token must be defined in secrets.yaml (do NOT inline)
 
 esphome:

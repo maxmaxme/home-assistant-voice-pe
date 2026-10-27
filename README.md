@@ -2,7 +2,7 @@
 
 # 🗣️ home-assistant-voice-pe · va-direct fork
 
-**ESPHome firmware that turns a voice device into a thin client streaming audio straight to a [`voice-assistant`](https://github.com/maxmaxme/voice-assistant) backend** — no Home Assistant `voice_assistant` pipeline on the audio path.
+**ESPHome firmware that turns a voice device into a thin client streaming audio straight to a [`pipecat-voice`](https://github.com/maxmaxme/pipecat-voice) backend** (which takes its tools, prompt and settings from [`voice-assistant`](https://github.com/maxmaxme/voice-assistant)) — no Home Assistant `voice_assistant` pipeline on the audio path.
 
 [![License: ESPHome (GPLv3/MIT)](https://img.shields.io/badge/license-ESPHome%20(GPLv3%2FMIT)-blue.svg)](LICENSE) [![Fork of esphome/home-assistant-voice-pe](https://img.shields.io/badge/fork%20of-esphome%2Fhome--assistant--voice--pe-444.svg?logo=github)](https://github.com/esphome/home-assistant-voice-pe)
 
@@ -25,9 +25,10 @@ flowchart LR
       MIC["🎙️ mic"] --> VAC
       VAC --> SPK["🔊 speaker"]
     end
-    VAC -- "WS /voice · PCM16 · bearer" --> BE["voice-assistant<br/>:3001"]
+    VAC -- "WS /voice · PCM16 · bearer" --> BE["pipecat-voice<br/>:3002"]
     BE --> OAI["OpenAI Realtime<br/>STT · LLM · TTS"]
-    BE -- "MCP tools" --> HA["🏠 Home Assistant"]
+    BE -- "MCP: tools, prompt, settings" --> VA["voice-assistant"]
+    VA -- "MCP tools" --> HA["🏠 Home Assistant"]
     HA -. "announcements (api:)" .-> DEV
 ```
 
