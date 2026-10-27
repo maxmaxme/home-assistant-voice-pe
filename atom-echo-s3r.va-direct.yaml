@@ -2,7 +2,7 @@ substitutions:
   name: atom-echo-s3r
   friendly_name: Atom Echo S3R
   # va-direct: voice-assistant WS endpoint (mDNS on LAN).
-  va_url: "ws://va.local:3001/voice"
+  va_url: "ws://va.local:3002/voice"
 
 esphome:
   name: ${name}
