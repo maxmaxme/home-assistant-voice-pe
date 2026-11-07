@@ -17,7 +17,7 @@ concurrency:
 env:
   # Single source for the pinned ESPHome version: the install step and the
   # ESP-IDF cache key both read it, so a bump invalidates the toolchain cache.
-  ESPHOME_VERSION: "2026.9.1"
+  ESPHOME_VERSION: "2026.10.2"
   # Bound the compiler cache; one config's full build is ~2k objects.
   CCACHE_MAXSIZE: 500M
 
