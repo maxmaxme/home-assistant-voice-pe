@@ -43,6 +43,12 @@
       "matchDepNames": ["esphome"],
       "groupName": "esphome",
       "automerge": false
+    },
+    {
+      "description": "CI Python must stay inside ESPHome's Requires-Python (currently <3.15), not track the newest CPython; bump it by hand",
+      "matchManagers": ["github-actions"],
+      "matchDepNames": ["python"],
+      "enabled": false
     }
   ]
 }
