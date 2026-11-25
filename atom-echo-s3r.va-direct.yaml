@@ -3,6 +3,9 @@ substitutions:
   friendly_name: Atom Echo S3R
   # va-direct: voice-assistant WS endpoint (mDNS on LAN).
   va_url: "ws://va.local:3002/voice"
+  # Git commit this image was built from; flash-all.sh passes it with
+  # `-s fw_rev`, so a plain `esphome run` reports "local".
+  fw_rev: local
 
 esphome:
   name: ${name}
@@ -661,3 +664,12 @@ binary_sensor:
                           switch.is_off: master_mute_switch
                         then:
                           - script.execute: start_turn
+
+# Reports fw_rev so a host-side check can spot a speaker running an older build.
+text_sensor:
+  - platform: template
+    name: Firmware revision
+    id: firmware_revision
+    entity_category: diagnostic
+    lambda: return {"${fw_rev}"};
+    update_interval: 1h

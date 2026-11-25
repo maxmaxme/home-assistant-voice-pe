@@ -42,6 +42,9 @@ substitutions:
   # va-direct: voice-assistant WS endpoint on the Pi (mDNS resolves on LAN).
   va_url: "ws://va.local:3002/voice"
   # va_device_token must be defined in secrets.yaml (do NOT inline)
+  # Git commit this image was built from; flash-all.sh passes it with
+  # `-s fw_rev`, so a plain `esphome run` reports "local".
+  fw_rev: local
 
 esphome:
   name: home-assistant-voice
@@ -1896,3 +1899,12 @@ button:
 
 debug:
   update_interval: 5s
+
+# Reports fw_rev so a host-side check can spot a speaker running an older build.
+text_sensor:
+  - platform: template
+    name: Firmware revision
+    id: firmware_revision
+    entity_category: diagnostic
+    lambda: return {"${fw_rev}"};
+    update_interval: 1h

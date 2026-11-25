@@ -34,7 +34,7 @@ Both va-direct configs DO keep a native `api:` connection to HA, but only as an 
 | `atom-echo-s3r.mic-diag.yaml` | Diagnostics wrapper for the Atom (`packages:` + `!extend` over the va-direct config, same device): logs per-0.5 s mic-stream stats (outliers, DC, RMS, peak) under `micdiag`, restarts the mic every 6 s and dumps ES8311 registers. Flash it to measure mic starts without talking; flash the va-direct config to go back. Not built in CI. |
 | `voice-kit.yaml` | XMOS voice-kit component. Shared between configs. |
 | `secrets.yaml` | **Gitignored.** Holds `va_device_token` (the Voice PE's own bearer), `va_device_token_atom` (the Atom Echo's own bearer) — each must be registered as a `voice` device for some user in the backend — and `ap_password` (see Secrets below). The backend URL is the `va_url` **substitution** at the top of each va-direct yaml, not a secret. |
-| `flash-all.sh` | OTA-flashes both va-direct configs in parallel (`esphome run … --no-logs`). |
+| `flash-all.sh` | OTA-flashes both va-direct configs in parallel (`esphome run … --no-logs`). Passes the checkout's short commit (`-dirty` if the tree has changes) as the `fw_rev` substitution, which both configs report as the diagnostic `Firmware revision` text sensor; a plain `esphome run` reports `local`. |
 | `sounds/` | The UI sounds (wake / mute / button / error chimes), byte-identical to upstream `dev`'s and refreshed by upstream syncs. The VPE yaml points at these local files so a compile needs no network for them. |
 
 ## Custom component: `esphome/components/va_client/`

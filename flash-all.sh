@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+# Baked into the "Firmware revision" sensor so a stale speaker is visible.
+FW_REV="$(git rev-parse --short=7 HEAD)$(git diff --quiet HEAD -- || echo -dirty)"
+
 run() {
   local tag="$1" yaml="$2"
-  esphome run "$yaml" --no-logs 2>&1 | sed "s/^/[$tag] /"
+  esphome -s fw_rev "$FW_REV" run "$yaml" --no-logs 2>&1 | sed "s/^/[$tag] /"
   return "${PIPESTATUS[0]}"
 }
 
